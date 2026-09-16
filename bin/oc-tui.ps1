@@ -37,9 +37,22 @@ function Test-Server {
   try { Invoke-RestMethod -Uri "$Url/session" -TimeoutSec 4 -ErrorAction Stop | Out-Null; return $true }
   catch { return $false }
 }
+# Kho phien cua opencode dung chung toan may: hoi server cua repo A ve phien cua
+# repo B van tra ve day du. Phien chi dung duoc khi directory cua no khop repo hien tai.
+# Tra ve: ok = phien ton tai VA thuoc dung repo; exists = phien con tren server;
+# directory = thu muc that cua phien. Khong goi duoc server hoac khong doc duoc
+# directory thi coi nhu khong dung duoc (exists = false).
 function Test-Session($sid) {
-  try { Invoke-RestMethod -Uri "$Url/session/$sid" -TimeoutSec 6 -ErrorAction Stop | Out-Null; return $true }
-  catch { return $false }
+  $dir = $null
+  try {
+    $one = Invoke-RestMethod -Uri "$Url/session/$sid" -TimeoutSec 6 -ErrorAction Stop
+    if ($one -and $one.directory) { $dir = [string]$one.directory }
+  } catch {
+    return @{ ok = $false; exists = $false; directory = "" }
+  }
+  if (-not $dir) { return @{ ok = $false; exists = $false; directory = "" } }
+  $same = ((Normalize-RepoPath $dir) -ieq (Normalize-RepoPath $repo))
+  return @{ ok = $same; exists = $true; directory = $dir }
 }
 # Chuan hoa duong dan truoc khi so sanh: git tra F:/x, server tra F:\x.
 function Normalize-RepoPath($p) {
@@ -142,9 +155,13 @@ if ($map) { $map.PSObject.Properties | ForEach-Object { $table[$_.Name] = $_.Val
 $sid = $null
 if (-not $Fresh -and $table.ContainsKey($Key)) {
   $candidate = $table[$Key].opencode_session
-  if ($candidate -and (Test-Session $candidate)) {
+  $check = $null
+  if ($candidate) { $check = Test-Session $candidate }
+  if ($candidate -and $check.ok) {
     $sid = $candidate
     Write-Output "  DUNG LAI phien opencode cu: $sid"
+  } elseif ($candidate -and $check.exists) {
+    Write-Output "  phien cu ($candidate) thuoc repo '$($check.directory)', khong dung duoc o day - se tao phien moi"
   } else {
     Write-Output "  phien cu ($candidate) khong con tren server, se tao moi"
   }
