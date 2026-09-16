@@ -1,2 +1,7 @@
-.pipeline/
+# runtime cua pipeline khi repo nay tu dung chinh no de phat trien
+.pipeline/logs/
+.pipeline/tui.json
+.pipeline/tui-map.json
+.pipeline/codex-map.json
+.pipeline/pipeline.config.json
 node_modules/
