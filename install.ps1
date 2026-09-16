@@ -7,7 +7,8 @@
 #>
 param(
   [string]$Target = ".",
-  [switch]$Force
+  [switch]$Force,
+  [switch]$NoGitTrack
 )
 
 $ErrorActionPreference = "Stop"
@@ -88,6 +89,23 @@ foreach ($f in $dataFiles) {
     Set-Content -Path $dest -Value $raw -Encoding UTF8
   } else {
     Copy-Item -Path $f.Src -Destination $dest -Force
+  }
+}
+
+# 4b. -NoGitTrack: dat .gitignore '*' vao cac thu muc cua goi de git khong thay.
+# '*' ignore moi thu trong thu muc, ke ca chinh file .gitignore nay; file da
+# tracked tu truoc khong bi anh huong. Chay sau muc 4 nen luon thang ca
+# "GIU NGUYEN" lan -Force.
+if ($NoGitTrack) {
+  $trackDirs = @(".pipeline", ".claude\agents", ".claude\skills\pipeline")
+  foreach ($d in $trackDirs) {
+    $dest = Join-Path $targetPath (Join-Path $d ".gitignore")
+    if (Test-Path $dest) {
+      Write-Output "DE: $d\.gitignore (NoGitTrack)"
+    } else {
+      Write-Output "TAO: $d\.gitignore (NoGitTrack)"
+    }
+    Set-Content -Path $dest -Value "*" -Encoding UTF8
   }
 }
 

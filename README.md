@@ -32,6 +32,26 @@ nhiều lần: lần sau chỉ cập nhật phần code, giữ nguyên `pipeline
 `state.json`. Thêm `-Force` nếu muốn đè cả file dữ liệu — khi đó install in rõ từng file
 bị đè.
 
+### -NoGitTrack
+
+Dùng khi repo đích đã commit `.claude/` và bạn không muốn file của pipeline hiện trong
+`git status` hay bị push lên remote chung:
+
+```powershell
+.\install.ps1 -Target <duong-dan-repo-dich> -NoGitTrack
+```
+
+Cờ này ghi `.gitignore` chứa đúng một dòng `*` vào `.pipeline/`, `.claude/agents/` và
+`.claude/skills/pipeline/`. Ba file đó tự ignore chính nó nên không được commit: clone
+repo đích ở máy khác là mất, phải chạy lại `install.ps1 -NoGitTrack`.
+
+Giới hạn: nó giấu **cả thư mục** với git, không chỉ file của gói. Nếu team có agent riêng
+trong `.claude/agents/`, file **mới chưa tracked** của họ cũng biến mất khỏi `git status`
+và dễ bị quên commit; file đã tracked từ trước vẫn tracked bình thường.
+
+Đây **không** phải hàng rào chống đồng nghiệp lỡ tay commit. Muốn vậy phải thêm rule vào
+`.gitignore` gốc của repo đích và chấp nhận diff của chính rule đó.
+
 ## Cây thư mục sau khi cài
 
 ```
