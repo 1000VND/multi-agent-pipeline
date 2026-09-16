@@ -1,0 +1,213 @@
+<#
+  oc-run.ps1 - Chay opencode cho 1 task brief, ghi full log ra file,
+  chi tra ve summary ngan cho Claude doc.
+  Muc dich: Claude khong phai nuot toan bo stdout cua opencode.
+
+  Model mac dinh: deepseek-v4.1-flash (variant max).
+  Fallback: mimo-v2.5-pro - chi chay khi luot dau KHONG sinh ra thay doi nao.
+#>
+param(
+  [Parameter(Mandatory = $true)][string]$TaskFile,
+  [string]$Model    = "",
+  [string]$Variant  = "",
+  [string]$Fallback = "",
+  [string]$FallbackVariant = "",
+  [switch]$NoFallback,
+  [string]$Tag = "",
+  [switch]$Resume,
+  [string]$Attach  = "",  # vd http://127.0.0.1:4096 de ban xem live qua TUI/web
+  [string]$Session = "",  # ghim session ID de moi lenh roi vao DUNG phien ban dang attach
+  [switch]$NewTui,        # co cu: TUI gio bat mac dinh, tham so nay khong con tac dung rieng
+  [switch]$FreshTui,      # kem -NewTui: ep tao phien opencode moi thay vi dung lai phien cu
+  [switch]$NoTui,         # tat han cua so TUI (mac dinh la bat)
+  [int]$TimeoutSec = 0
+)
+
+$ErrorActionPreference = "Stop"
+$repo = (& git rev-parse --show-toplevel 2>$null)
+if (-not $repo) { Write-Output "Khong phai git repo. Pipeline nay bat buoc dung git."; exit 2 }
+
+# Doc cau hinh pipeline cua repo. Uu tien: tham so dong lenh > config > mac dinh built-in.
+$pipelineConfig = $null
+$configPath = Join-Path $repo ".pipeline\pipeline.config.json"
+try {
+  if (Test-Path $configPath) {
+    $pipelineConfig = Get-Content -Raw -Encoding UTF8 $configPath | ConvertFrom-Json
+  }
+} catch {
+  $pipelineConfig = $null
+}
+if (-not $pipelineConfig) {
+  Write-Output "CONFIG: khong doc duoc .pipeline/pipeline.config.json - dung mac dinh built-in"
+}
+$cfgOpenCode = $null
+if ($pipelineConfig) { $cfgOpenCode = $pipelineConfig.model_policy.opencode }
+if (($Model -eq "") -and $cfgOpenCode.primary) { $Model = [string]$cfgOpenCode.primary }
+if ($Model -eq "") { $Model = "opencode-go/deepseek-v4.1-flash" }
+if (($Variant -eq "") -and $cfgOpenCode.variant) { $Variant = [string]$cfgOpenCode.variant }
+if ($Variant -eq "") { $Variant = "max" }
+if (($Fallback -eq "") -and $cfgOpenCode.fallback) { $Fallback = [string]$cfgOpenCode.fallback }
+if ($Fallback -eq "") { $Fallback = "opencode-go/mimo-v2.5-pro" }
+if (($TimeoutSec -le 0) -and $pipelineConfig.timeout_sec) { $TimeoutSec = [int]$pipelineConfig.timeout_sec }
+if ($TimeoutSec -le 0) { $TimeoutSec = 1200 }
+$testCommand = ""
+if ($pipelineConfig) { $testCommand = [string]$pipelineConfig.test_command }
+if ($testCommand -eq "") { $testCommand = 'python -m unittest discover -s downloader -p "test_*.py"' }
+
+if (-not (Test-Path $TaskFile)) { Write-Output "Khong thay task file: $TaskFile"; exit 2 }
+
+# Bat buoc worktree sach truoc khi giao viec -> git diff sau do = dung
+# phan opencode vua lam, khong lan voi thay doi cu.
+$dirty = & git status --porcelain
+if ($dirty -and -not $Resume) {
+  Write-Output "BLOCKED: worktree chua sach. Commit hoac stash truoc khi giao task."
+  Write-Output $dirty
+  exit 3
+}
+
+# TUI bat mac dinh: dong cua so TUI cu, lay/tao phien opencode cua phien Claude nay,
+# mo cua so CMD moi ghim vao no. Tat bang -NoTui; -NewTui chi con la co cu.
+if (-not $NoTui) {
+  if ($Attach -eq "") { $Attach = "http://127.0.0.1:4096" }
+  $tuiArgs = @("-Url", $Attach, "-Title", "Task $([IO.Path]::GetFileNameWithoutExtension($TaskFile))")
+  if ($FreshTui) { $tuiArgs += "-Fresh" }
+  $tui = & powershell -NoProfile -File (Join-Path $PSScriptRoot "oc-tui.ps1") @tuiArgs
+  $tui | ForEach-Object { Write-Output $_ }
+  $line = $tui | Where-Object { $_ -match "^SESSION=" } | Select-Object -Last 1
+  if (-not $line) { Write-Error "oc-tui.ps1 khong tra ve session id."; exit 6 }
+  $Session = $line -replace "^SESSION=", ""
+} else {
+  Write-Output "TUI: tat theo yeu cau (-NoTui)"
+}
+
+$base = [IO.Path]::GetFileNameWithoutExtension($TaskFile)
+if ($Tag -eq "") { $Tag = (Get-Date -Format "HHmmss") }
+$logDir = Join-Path $repo ".pipeline\logs"
+if (-not (Test-Path $logDir)) { New-Item -ItemType Directory -Path $logDir | Out-Null }
+
+$head   = & git rev-parse HEAD
+$prompt    = Get-Content -Raw -Encoding UTF8 -Path $TaskFile
+# PowerShell 5.1 khong tu escape dau nhay kep khi goi native exe: prompt co dau "
+# se bi tach thanh nhieu argv va opencode in help roi thoat. Nhan doi backslash
+# dung truoc roi escape dau nhay theo quy uoc dong lenh Windows.
+$promptArg = $prompt -replace '(\\*)"', '$1$1\"'
+
+# opencode in usage/help khi prompt khong toi noi nguyen ven -> nhan dien de khong dot fallback.
+function Test-ArgError($logPath) {
+  if (-not (Test-Path $logPath)) { return $false }
+  $head = Get-Content -Path $logPath -TotalCount 5 -ErrorAction SilentlyContinue
+  return [bool]($head -match 'opencode run \[message')
+}
+
+function Invoke-OpenCode($modelId, $variantName, $logPath) {
+  $ocArgs = @("run", "--auto", "--model", $modelId)
+  if ($variantName -ne "") { $ocArgs += @("--variant", $variantName) }
+  if ($Attach  -ne "")     { $ocArgs += @("--attach", $Attach) }
+  if ($Session -ne "")     { $ocArgs += @("--session", $Session) }
+  if ($Resume)             { $ocArgs += "--continue" }
+  $ocArgs += $promptArg
+
+  $label = if ($variantName -ne "") { "$modelId (variant $variantName)" } else { $modelId }
+  Write-Output "=> opencode $label | task=$base | log=$logPath"
+  if ($Attach -ne "") {
+    $watch = if ($Session -ne "") { "opencode attach $Attach -s $Session" } else { "opencode attach $Attach -c" }
+    Write-Output "   xem live: $watch"
+  }
+
+  $sw = [Diagnostics.Stopwatch]::StartNew()
+  # stdout+stderr -> file. Timeout bang job de khong treo session.
+  $job = Start-Job -ScriptBlock {
+    param($a, $l, $cwd)
+    Set-Location $cwd
+    & opencode @a *>&1 | Out-File -FilePath $l -Encoding utf8
+    $LASTEXITCODE
+  } -ArgumentList $ocArgs, $logPath, $repo
+
+  if (-not (Wait-Job $job -Timeout $TimeoutSec)) {
+    Stop-Job $job; Remove-Job $job -Force
+    $sw.Stop()
+    Write-Output "TIMEOUT sau ${TimeoutSec}s - xem log: $logPath"
+    return @{ code = 124; secs = [int]$sw.Elapsed.TotalSeconds }
+  }
+  $code = Receive-Job $job
+  Remove-Job $job -Force
+  $sw.Stop()
+  return @{ code = $code; secs = [int]$sw.Elapsed.TotalSeconds }
+}
+
+# ---------- luot chinh ----------
+$log = Join-Path $logDir "$base-$Tag.log"
+$r   = Invoke-OpenCode $Model $Variant $log
+$usedModel = $Model
+$changed   = & git status --porcelain
+
+# ---------- fallback ----------
+# Chi fallback khi luot dau KHONG dong vao file nao. Neu no da sua do dang
+# roi hong, de nguyen cho Claude xem xet - khong tha model thu hai vao
+# dam len thay doi cua model thu nhat.
+if ((-not $changed) -and (-not $NoFallback) -and ($Fallback -ne "") -and (-not (Test-ArgError $log))) {
+  Write-Output ""
+  Write-Output "--- luot dau khong sinh thay doi (exit=$($r.code)) -> thu fallback ---"
+  $log = Join-Path $logDir "$base-$Tag-fallback.log"
+  $r   = Invoke-OpenCode $Fallback $FallbackVariant $log
+  $usedModel = $Fallback
+  $changed   = & git status --porcelain
+}
+
+$stat = & git diff --stat
+
+# ---------- tu chay test suite khi co file thay doi ----------
+$testsRan    = $false
+$testsFailed = $false
+$testsTail   = @()
+if ($changed) {
+  if ($testCommand -ne "") {
+    $prevEAP = $ErrorActionPreference
+    $ErrorActionPreference = "Continue"
+    try {
+      # 2>&1 phai nam trong chuoi IEX: redirect ben ngoai khong bat duoc stderr cua lenh native.
+      $testsText = (Invoke-Expression ($testCommand + " 2>&1") | Out-String)
+      $testsRan  = $true
+    } catch {
+      $testsRan = $false
+    }
+    $ErrorActionPreference = $prevEAP
+  }
+  if ($testsRan) {
+    if ($testsText -cmatch '(?m)^(FAILED|ERROR:)') { $testsFailed = $true }
+    $lines = @($testsText -split "`r?`n" | Where-Object { $_.Trim() -ne "" })
+    if ($lines.Count -ge 2) { $testsTail = @($lines[-2], $lines[-1]) } else { $testsTail = $lines }
+  }
+}
+
+Write-Output ""
+Write-Output "--- KET QUA ($($r.secs)s, exit=$($r.code)) ---"
+Write-Output "MODEL DA DUNG: $usedModel"
+Write-Output "BASE_COMMIT: $head"
+Write-Output "FILES THAY DOI:"
+if ($changed) { Write-Output $changed } else { Write-Output "  (KHONG CO FILE NAO THAY DOI - coi nhu task that bai)" }
+Write-Output ""
+Write-Output "DIFFSTAT:"
+Write-Output $stat
+if ($changed) {
+  Write-Output ""
+  if ($testsRan) {
+    Write-Output "TESTS:"
+    Write-Output $testsTail
+    if ($testsFailed) { Write-Output "TESTS: FAILED - xem chi tiet o tren" }
+  } else {
+    Write-Output "TESTS: khong chay duoc test_command - bo qua"
+  }
+}
+Write-Output ""
+Write-Output "--- 40 DONG CUOI CUA LOG ---"
+Get-Content $log -Tail 40
+Write-Output "--- (full log: $log) ---"
+
+if ($testsFailed) { exit 8 }
+if (Test-ArgError $log) {
+  Write-Output "ARGERROR: opencode in usage/help - prompt khong toi noi nguyen ven, KHONG phai model tu choi task"
+  exit 7
+}
+if (-not $changed) { exit 5 }
+exit 0

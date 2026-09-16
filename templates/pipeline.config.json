@@ -1,0 +1,20 @@
+{
+  "project_name": "<ten repo>",
+  "test_command": "",
+  "test_command_targeted": "",
+  "timeout_sec": 1200,
+  "forbidden_paths": [".env", "config/", "cache/", "logs/", "state/"],
+  "rules_docs": [],
+  "model_policy": {
+    "opencode": {
+      "primary": "opencode-go/deepseek-v4.1-flash",
+      "variant": "max",
+      "fallback": "opencode-go/mimo-v2.5-pro"
+    },
+    "codex": {
+      "default": { "model": "gpt-5.6-luna", "reasoning_effort": "xhigh" },
+      "escalated": { "model": "gpt-5.6-terra", "reasoning_effort": "high" },
+      "forbidden": ["gpt-5.6-sol", "gpt-6-astra"]
+    }
+  }
+}
