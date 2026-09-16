@@ -1,15 +1,29 @@
-# claude-pipeline
+# multi-agent-pipeline
 
 Not affiliated with Anthropic or OpenAI.
 
 Gói tooling cho vòng lặp **Claude plan → giao task cho OpenCode hoặc Codex → Claude review**.
 Gói chỉ chứa tooling; không chứa code của dự án nào.
 
+## Yêu cầu
+
+Gói **chỉ chạy trên Windows**: toàn bộ là Windows PowerShell 5.1, có dùng `taskkill /T /F`,
+`Start-Process`, và đường dẫn `%USERPROFILE%\.codex\sessions`.
+
+- Windows PowerShell 5.1 (`install.ps1` cảnh báo nếu không phải bản này)
+- git
+- `codex` trong PATH và **đã đăng nhập** — cần cho lane Codex
+- `opencode` trong PATH — cần cho lane OpenCode
+- python hoặc runtime test của dự án — tùy `test_command`
+
+`install.ps1` in báo cáo `== DIEU KIEN CHAY ==` với OK/THIEU cho từng thứ; thiếu thì không
+fail, chỉ báo lane nào không dùng được.
+
 ## Cài đặt
 
 ```powershell
-git clone <repo-goi-nay>
-cd claude-pipeline
+git clone https://github.com/1000VND/multi-agent-pipeline.git
+cd multi-agent-pipeline
 .\install.ps1 -Target <duong-dan-repo-dich>
 ```
 
@@ -38,12 +52,24 @@ bị đè.
 `.claude/agents` và `.claude/skills/pipeline/SKILL.md` phải nằm đúng vị trí đó theo quy
 định của Claude Code; runner và state nằm gọn trong `.pipeline/`.
 
+## Chạy một task
+
+Giao một task cho coder bằng một trong hai runner (chạy trong repo đích):
+
+```powershell
+powershell -NoProfile -File .pipeline\bin\oc-run.ps1    -TaskFile .pipeline\tasks\<id>.md
+powershell -NoProfile -File .pipeline\bin\codex-run.ps1 -TaskFile .pipeline\tasks\<id>.md
+```
+
+Lượt sửa lỗi thêm `-Resume` để nối đúng phiên/thread của lượt trước. Brief phải **tự chứa**
+vì coder không thấy hội thoại này. Chi tiết quy trình nằm trong `SKILL.md` mà Claude đọc.
+
 ## pipeline.config.json
 
 | Khóa | Ý nghĩa |
 |---|---|
 | `project_name` | Tên repo; install tự điền theo tên thư mục đích. |
-| `test_command` | Lệnh test toàn bộ; runner tự chạy khi coder có thay đổi file. |
+| `test_command` | Lệnh test toàn bộ; runner tự chạy khi coder có thay đổi file. Để trống thì runner không chạy gì và in `TESTS: khong co test_command trong .pipeline/pipeline.config.json - bo qua` — hành vi có chủ đích, không phải lỗi. |
 | `test_command_targeted` | Lệnh test mục tiêu; orchestrator dùng khi review. |
 | `timeout_sec` | Timeout mặc định cho mỗi lượt runner (giây). |
 | `forbidden_paths` | Vùng cấm đụng; brief giao coder phải nhắc lại. |
@@ -64,10 +90,42 @@ chạy tiếp bằng mặc định built-in, không fail.
 Cấm dùng `gpt-5.6-sol` và `gpt-6-astra` để implement code; runner Codex chặn cứng bằng
 `exit 2`. Thang leo bậc và luật worktree sạch nằm trong `SKILL.md`.
 
+## Lane Codex
+
+- Mặc định runner mở **TUI Codex gốc** để người dùng nhìn thấy nó đang làm việc; cửa sổ ở
+  lại sau khi xong để đọc tiếp (runner in PID, đóng khi nào người dùng muốn).
+- `-Exec` hoặc `-NoTui` chạy headless, không mở cửa sổ nào.
+- TUI cần thư mục repo nằm trong danh sách tin cậy của Codex (`~/.codex/config.toml`, mục
+  `[projects.'...']` với `trust_level = "trusted"`). Thư mục lạ thì TUI chặn lại hỏi xác
+  nhận, runner chỉ biết chờ tới timeout. Cách mồi: chạy một lượt `-NoTui` nhỏ trong repo
+  đó trước — lượt headless tự đăng ký tin cậy.
+- Log JSONL nằm trong `.pipeline/logs/`: chế độ TUI sao chép rollout của Codex thành
+  `<task>-<tag>-native.jsonl`; chế độ headless ghi `<task>-<tag>-codex.jsonl` cộng `.err`
+  cho stderr.
+
+## Mã thoát
+
+| Mã | Nghĩa |
+|---|---|
+| 0 | xong, có thay đổi file |
+| 2 | không phải git repo / không thấy task file / model bị cấm |
+| 3 | worktree bẩn (chỉ lượt không `-Resume`) |
+| 4 | thiếu Codex CLI, hoặc không có thread đã lưu để `-Resume` (chỉ lane Codex) |
+| 5 | lượt này không sửa gì — coi như thất bại |
+| 6 | `oc-tui.ps1` không trả về session id (chỉ lane OpenCode) |
+| 7 | CLI hỏng cứng, không phải model từ chối task |
+| 8 | có thay đổi nhưng `test_command` fail |
+| 9 | phiên opencode thuộc repo khác — chặn để khỏi sửa nhầm dự án (chỉ lane OpenCode) |
+| 124 | quá `timeout_sec`. Lane Codex: `codex-run.ps1` giết cả cây tiến trình rồi thoát 124. Lane OpenCode: in `TIMEOUT` và báo `exit=124` trong tóm tắt, còn mã thoát cuối theo kết quả (5/0/8). |
+
 ## Lưu ý
 
 - Lane OpenCode tự tìm server riêng của từng repo trong dải cổng `4096-4105`, nên chạy
   nhiều repo song song thì mỗi repo chiếm một cổng trong dải đó.
+- Nếu runner in `BLOCKED: phien opencode dang o '<duong dan>'` thì phiên opencode đang
+  thuộc repo khác — dùng `-NoTui`, hoặc đóng server đang chiếm cổng, rồi chạy lại. Lỗi
+  này từng làm coder sửa nhầm sang một dự án khác nên chốt chặn cố ý `exit 9` (chặn hẳn
+  thay vì cảnh báo).
 
 ## Cập nhật
 
