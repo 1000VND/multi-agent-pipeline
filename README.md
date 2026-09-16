@@ -1,5 +1,7 @@
 # claude-pipeline
 
+Not affiliated with Anthropic or OpenAI.
+
 Gói tooling cho vòng lặp **Claude plan → giao task cho OpenCode hoặc Codex → Claude review**.
 Gói chỉ chứa tooling; không chứa code của dự án nào.
 

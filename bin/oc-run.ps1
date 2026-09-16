@@ -52,7 +52,6 @@ if (($TimeoutSec -le 0) -and $pipelineConfig.timeout_sec) { $TimeoutSec = [int]$
 if ($TimeoutSec -le 0) { $TimeoutSec = 1200 }
 $testCommand = ""
 if ($pipelineConfig) { $testCommand = [string]$pipelineConfig.test_command }
-if ($testCommand -eq "") { $testCommand = 'python -m unittest discover -s downloader -p "test_*.py"' }
 
 if (-not (Test-Path $TaskFile)) { Write-Output "Khong thay task file: $TaskFile"; exit 2 }
 
@@ -195,6 +194,8 @@ if ($changed) {
     Write-Output "TESTS:"
     Write-Output $testsTail
     if ($testsFailed) { Write-Output "TESTS: FAILED - xem chi tiet o tren" }
+  } elseif ($testCommand -eq "") {
+    Write-Output "TESTS: khong co test_command trong .pipeline/pipeline.config.json - bo qua"
   } else {
     Write-Output "TESTS: khong chay duoc test_command - bo qua"
   }

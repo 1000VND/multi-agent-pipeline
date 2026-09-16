@@ -46,7 +46,6 @@ if (($TimeoutSec -le 0) -and $pipelineConfig.timeout_sec) { $TimeoutSec = [int]$
 if ($TimeoutSec -le 0) { $TimeoutSec = 1200 }
 $testCommand = ""
 if ($pipelineConfig) { $testCommand = [string]$pipelineConfig.test_command }
-if ($testCommand -eq "") { $testCommand = 'python -m unittest discover -s downloader -p "test_*.py"' }
 
 # Model bi cam dung de implement code (co the ghi de trong pipeline.config.json).
 $forbiddenModels = @("gpt-5.6-sol", "gpt-6-astra")
@@ -491,6 +490,8 @@ if ($changed) {
     Write-Output "TESTS:"
     Write-Output $testsTail
     if ($testsFailed) { Write-Output "TESTS: FAILED - Claude can review chi tiet" }
+  } elseif ($testCommand -eq "") {
+    Write-Output "TESTS: khong co test_command trong .pipeline/pipeline.config.json - bo qua"
   } else {
     Write-Output "TESTS: khong chay duoc test_command - bo qua"
   }
