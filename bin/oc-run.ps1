@@ -167,24 +167,61 @@ function Invoke-OpenCode($modelId, $variantName, $logPath) {
   }
 
   $sw = [Diagnostics.Stopwatch]::StartNew()
+  # Job tu ghi PID cua no ra file trong TEMP de cha biet duong giet ca cay khi
+  # het gio; khong doi cach truyen prompt (van splatting qua job).
+  $pidFile = Join-Path $env:TEMP ("oc-run-{0}-{1}.pid" -f $Tag, [guid]::NewGuid().ToString("N").Substring(0, 8))
   # stdout+stderr -> file. Timeout bang job de khong treo session.
   $job = Start-Job -ScriptBlock {
-    param($a, $l, $cwd)
+    param($a, $l, $cwd, $pf)
+    Set-Content -Path $pf -Value $PID
     Set-Location $cwd
     & opencode @a *>&1 | Out-File -FilePath $l -Encoding utf8
     $LASTEXITCODE
-  } -ArgumentList $ocArgs, $logPath, $repo
+  } -ArgumentList $ocArgs, $logPath, $repo, $pidFile
 
   if (-not (Wait-Job $job -Timeout $TimeoutSec)) {
-    Stop-Job $job; Remove-Job $job -Force
+    # Stop-Job chi giet job PowerShell, opencode.exe ma job de ra van song tiep.
+    # Doc pid file, xac nhan dung job powershell (PID co the da bi cap lai cho
+    # tien trinh khac), roi diet cay cac con cua no (opencode + con chau).
+    # Khong taskkill thang vao job: job process bi giet cung lam PowerShell cho
+    # them ~60s khi don job, trong khi diet con thi job tu ket thuc va script thoat ngay.
+    $killedPid = $null
+    if (Test-Path $pidFile) {
+      $rawPid = Get-Content -Path $pidFile -ErrorAction SilentlyContinue | Select-Object -First 1
+      $jobPid = 0
+      if ($rawPid -and [int]::TryParse(([string]$rawPid).Trim(), [ref]$jobPid)) {
+        $jobProc = Get-Process -Id $jobPid -ErrorAction SilentlyContinue
+        if ($jobProc -and $jobProc.ProcessName -eq "powershell") {
+          $children = @(Get-CimInstance Win32_Process -Filter "ParentProcessId = $jobPid" -ErrorAction SilentlyContinue)
+          foreach ($c in $children) {
+            & taskkill.exe /PID $c.ProcessId /T /F | Out-Null
+            $killedPid = $c.ProcessId
+          }
+          if ($killedPid) {
+            $waitStop = [Diagnostics.Stopwatch]::StartNew()
+            while ((Get-Process -Id $killedPid -ErrorAction SilentlyContinue) -and $waitStop.Elapsed.TotalSeconds -lt 5) { Start-Sleep -Milliseconds 200 }
+          }
+        }
+      }
+    }
+    Stop-Job $job -ErrorAction SilentlyContinue
+    Remove-Job $job -Force -ErrorAction SilentlyContinue
+    Remove-Item -Path $pidFile -Force -ErrorAction SilentlyContinue
     $sw.Stop()
-    Write-Output "TIMEOUT sau ${TimeoutSec}s - xem log: $logPath"
-    return @{ code = 124; secs = [int]$sw.Elapsed.TotalSeconds }
+    # Write-Host vi $r = Invoke-OpenCode gom het Write-Output cua ham vao ket qua,
+    # khong hien ra console; dong TIMEOUT phai luon thay duoc.
+    if ($killedPid) {
+      Write-Host "TIMEOUT sau ${TimeoutSec}s - da giet tien trinh $killedPid va cac con - xem log: $logPath"
+    } else {
+      Write-Host "TIMEOUT sau ${TimeoutSec}s - xem log: $logPath"
+    }
+    return @{ code = 124; secs = [int]$sw.Elapsed.TotalSeconds; timedout = $true }
   }
   $code = Receive-Job $job
   Remove-Job $job -Force
+  Remove-Item -Path $pidFile -Force -ErrorAction SilentlyContinue
   $sw.Stop()
-  return @{ code = $code; secs = [int]$sw.Elapsed.TotalSeconds }
+  return @{ code = $code; secs = [int]$sw.Elapsed.TotalSeconds; timedout = $false }
 }
 
 # ---------- luot chinh ----------
@@ -198,8 +235,9 @@ $changed   = & git status --porcelain
 # ---------- fallback ----------
 # Chi fallback khi luot dau KHONG dong vao file nao. Neu no da sua do dang
 # roi hong, de nguyen cho Claude xem xet - khong tha model thu hai vao
-# dam len thay doi cua model thu nhat.
-if ((-not $changed) -and (-not $NoFallback) -and ($Fallback -ne "") -and (-not (Test-ArgError $log))) {
+# dam len thay doi cua model thu nhat. Timeout la chung cuoc: input khong
+# doi thi model thu hai cung chi het gio.
+if ((-not $changed) -and (-not $r.timedout) -and (-not $NoFallback) -and ($Fallback -ne "") -and (-not (Test-ArgError $log))) {
   Write-Output ""
   Write-Output "--- luot dau khong sinh thay doi (exit=$($r.code)) -> thu fallback ---"
   $log = Join-Path $logDir "$base-$Tag-fallback.log"
@@ -260,6 +298,9 @@ Write-Output "--- 40 DONG CUOI CUA LOG ---"
 Get-Content $log -Tail 40
 Write-Output "--- (full log: $log) ---"
 
+# Timeout la chung cuoc: luot bi cat ngang khong duoc coi la thanh cong chi vi
+# model kip sua vai file.
+if ($r.timedout) { exit 124 }
 if ($testsFailed) { exit 8 }
 if (Test-ArgError $log) {
   Write-Output "ARGERROR: opencode in usage/help - prompt khong toi noi nguyen ven, KHONG phai model tu choi task"
