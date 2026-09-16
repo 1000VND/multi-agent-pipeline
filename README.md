@@ -64,6 +64,11 @@ chạy tiếp bằng mặc định built-in, không fail.
 Cấm dùng `gpt-5.6-sol` và `gpt-6-astra` để implement code; runner Codex chặn cứng bằng
 `exit 2`. Thang leo bậc và luật worktree sạch nằm trong `SKILL.md`.
 
+## Lưu ý
+
+- Lane OpenCode tự tìm server riêng của từng repo trong dải cổng `4096-4105`, nên chạy
+  nhiều repo song song thì mỗi repo chiếm một cổng trong dải đó.
+
 ## Cập nhật
 
 ```powershell

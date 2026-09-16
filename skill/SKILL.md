@@ -131,6 +131,14 @@ Claude vừa giao việc gần nhất.
 Khoá là `CLAUDE_CODE_HOST_SESSION_ID` (fallback `CLAUDE_CODE_SESSION_ID`).
 Bản đồ: `.pipeline/tui-map.json`. Cửa sổ đang mở: `.pipeline/tui.json`.
 
+**Mỗi repo một server riêng:** server opencode gắn chặt với thư mục nó được khởi động, nên
+attach vào server của repo khác là coder đọc/sửa nhầm dự án. `oc-tui.ps1` tự dò dải cổng
+`4096-4105`: thấy server có `worktree` đúng repo hiện tại thì dùng, không thì khởi động
+server mới cho repo đó (chờ tối đa 30 giây rồi tự kiểm lại). Vì vậy chạy nhiều repo song
+song được, mỗi repo chiếm một cổng trong dải. Nếu runner in
+`BLOCKED: phien opencode dang o ...` thì nghĩa là server đang bị repo khác chiếm — dùng
+`-NoTui`, hoặc đóng server đang chiếm cổng đó rồi chạy lại.
+
 **Đánh đổi khi dùng lại phiên:** context của opencode tích lũy qua các task, tốn thêm
 input token và có thể lẫn chỉ dẫn của task cũ. Khi muốn bắt đầu sạch cho một task,
 thêm `-FreshTui` để ép tạo phiên opencode mới cho phiên Claude này.

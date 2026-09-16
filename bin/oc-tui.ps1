@@ -13,7 +13,7 @@
   dung phien opencode cua no, khong phai phien trang.
 #>
 param(
-  [string]$Url   = "http://127.0.0.1:4096",
+  [string]$Url   = "",   # rong = tu tim server cua repo (cong 4096-4105); truyen ro = ton trong nhung phai dung repo
   [string]$Title = "",
   [string]$Key   = "",   # ghi de khoa phien Claude (chu yeu de test)
   [switch]$Fresh,        # ep tao phien opencode moi cho phien Claude nay
@@ -41,6 +41,21 @@ function Test-Session($sid) {
   try { Invoke-RestMethod -Uri "$Url/session/$sid" -TimeoutSec 6 -ErrorAction Stop | Out-Null; return $true }
   catch { return $false }
 }
+# Chuan hoa duong dan truoc khi so sanh: git tra F:/x, server tra F:\x.
+function Normalize-RepoPath($p) {
+  if (-not $p) { return "" }
+  return ([string]$p -replace '/', '\').TrimEnd('\')
+}
+# worktree cua server: $null = khong ket noi duoc, "" = co dich vu khac, con lai la duong dan.
+function Get-Worktree($baseUrl) {
+  try {
+    $proj = Invoke-RestMethod -Uri "$baseUrl/project/current" -TimeoutSec 3 -ErrorAction Stop
+  } catch {
+    return $null
+  }
+  if ($proj -and $proj.worktree) { return [string]$proj.worktree }
+  return ""
+}
 
 # ---------- khoa phien Claude ----------
 if ($Key -eq "") { $Key = $env:CLAUDE_CODE_HOST_SESSION_ID }
@@ -61,16 +76,61 @@ if ($win -and $win.pid) {
 }
 if ($CloseOnly) { Write-Output "CloseOnly: xong."; exit 0 }
 
-# ---------- 2. dam bao server song ----------
-if (-not (Test-Server)) {
-  $port = ([uri]$Url).Port
+# ---------- 2. tim hoac tao server cua dung repo nay ----------
+# Server opencode gan chat voi thu muc no duoc khoi dong: attach vao server cua
+# repo khac la coder doc/sua nham du an. Vi vay moi repo phai co server rieng.
+$repoNorm = Normalize-RepoPath $repo
+
+function Start-RepoServer($port) {
   Write-Output "  bat server tren cong $port ..."
   Start-Process -FilePath "opencode.cmd" -ArgumentList @("serve", "--port", "$port") `
                 -WorkingDirectory $repo -WindowStyle Hidden | Out-Null
   $deadline = (Get-Date).AddSeconds(30)
-  while (-not (Test-Server)) {
-    if ((Get-Date) -gt $deadline) { Write-Error "Server khong len sau 30s."; exit 4 }
+  while ((Get-Date) -le $deadline) {
+    $wt = Get-Worktree "http://127.0.0.1:$port"
+    if ($wt -and ((Normalize-RepoPath $wt) -ieq $repoNorm)) { return }
     Start-Sleep -Milliseconds 400
+  }
+  [Console]::Error.WriteLine("LOI: server tren cong $port khong dung repo '$repo' sau 30s.")
+  exit 4
+}
+
+if ($Url -ne "") {
+  # Nguoi goi chi dinh ro: ton trong, nhung phai la server cua dung repo.
+  $Url = $Url.TrimEnd('/')
+  $wt = Get-Worktree $Url
+  if ($null -eq $wt) {
+    Start-RepoServer ([uri]$Url).Port
+  } elseif ($wt -eq "") {
+    [Console]::Error.WriteLine("LOI: $Url co dich vu khac, khong phai opencode.")
+    exit 4
+  } elseif ((Normalize-RepoPath $wt) -ine $repoNorm) {
+    [Console]::Error.WriteLine("LOI: server $Url dang phuc vu repo '$wt', khong phai '$repo'. Tu choi.")
+    exit 4
+  }
+} else {
+  # Quet cong 4096-4105: uu tien server cua dung repo, ghi nho cong trong dau tien.
+  $firstFree = 0
+  $chosen    = ""
+  for ($p = 4096; $p -le 4105; $p++) {
+    $cand = "http://127.0.0.1:$p"
+    $wt = Get-Worktree $cand
+    if ($null -eq $wt) {
+      if ($firstFree -eq 0) { $firstFree = $p }
+      continue
+    }
+    if ($wt -eq "") { continue }
+    if ((Normalize-RepoPath $wt) -ieq $repoNorm) { $chosen = $cand; break }
+  }
+  if ($chosen -ne "") {
+    $Url = $chosen
+    Write-Output "  dung server san co cua repo tren cong $(([uri]$Url).Port)"
+  } elseif ($firstFree -ne 0) {
+    $Url = "http://127.0.0.1:$firstFree"
+    Start-RepoServer $firstFree
+  } else {
+    [Console]::Error.WriteLine("LOI: het cong 4096-4105, moi cong deu bi server cua repo khac chiem.")
+    exit 4
   }
 }
 
@@ -119,4 +179,5 @@ $proc = Start-Process -FilePath "cmd.exe" `
   ConvertTo-Json | Set-Content -Path $winFile -Encoding utf8
 
 Write-Output "  mo cua so TUI (PID $($proc.Id))"
+Write-Output "URL=$Url"
 Write-Output "SESSION=$sid"

@@ -64,17 +64,70 @@ if ($dirty -and -not $Resume) {
   exit 3
 }
 
+# ---------- chot chan repo: phien opencode phai thuoc dung repo ----------
+# Chuan hoa duong dan truoc khi so sanh: git tra F:/x, server tra F:\x.
+function Normalize-RepoPath($p) {
+  if (-not $p) { return "" }
+  return ([string]$p -replace '/', '\').TrimEnd('\')
+}
+# Hoi server xem phien dang nam o thu muc nao; khac repo thi chan han (exit 9).
+# Khong hoi duoc server (mang/timeout) thi chi canh bao, khong chan - chot chan
+# khong duoc bien thanh diem chet moi.
+function Assert-SessionRepo($attachUrl, $sid) {
+  if ($sid -eq "") {
+    Write-Output "CANH BAO: khong co session id de doi chieu repo tren $attachUrl - bo qua chot chan."
+    return
+  }
+  $dir      = $null
+  $answered = $false
+  try {
+    $list     = Invoke-RestMethod -Uri "$attachUrl/session" -TimeoutSec 4 -ErrorAction Stop
+    $answered = $true
+    $hit = @($list) | Where-Object { $_.id -eq $sid } | Select-Object -First 1
+    if ($hit -and $hit.directory) { $dir = [string]$hit.directory }
+  } catch { }
+  if (-not $dir) {
+    try {
+      $one      = Invoke-RestMethod -Uri "$attachUrl/session/$sid" -TimeoutSec 4 -ErrorAction Stop
+      $answered = $true
+      if ($one -and $one.directory) { $dir = [string]$one.directory }
+    } catch { }
+  }
+  if (-not $dir) {
+    if ($answered) {
+      Write-Output "CANH BAO: khong tim thay phien $sid tren $attachUrl - bo qua chot chan."
+    } else {
+      Write-Output "CANH BAO: khong hoi duoc server $attachUrl - bo qua chot chan."
+    }
+    return
+  }
+  if ((Normalize-RepoPath $dir) -ine (Normalize-RepoPath $repo)) {
+    Write-Output "BLOCKED: phien opencode dang o '$dir' nhung repo hien tai la '$repo'."
+    Write-Output "Coder se sua nham du an. Dung -NoTui, hoac dong server dang chiem cong roi chay lai."
+    exit 9
+  }
+}
+
+# Nguoi goi ghim san -Attach/-Session: kiem ngay truoc khi mo TUI.
+if (($Attach -ne "") -and ($Session -ne "")) { Assert-SessionRepo $Attach $Session }
+
 # TUI bat mac dinh: dong cua so TUI cu, lay/tao phien opencode cua phien Claude nay,
 # mo cua so CMD moi ghim vao no. Tat bang -NoTui; -NewTui chi con la co cu.
+# -Attach chi duoc truyen tiep khi nguoi goi chi dinh ro; khong thi de oc-tui
+# tu tim server dung cua repo (moi repo mot server, cong 4096-4105).
 if (-not $NoTui) {
-  if ($Attach -eq "") { $Attach = "http://127.0.0.1:4096" }
-  $tuiArgs = @("-Url", $Attach, "-Title", "Task $([IO.Path]::GetFileNameWithoutExtension($TaskFile))")
+  $tuiArgs = @()
+  if ($Attach -ne "") { $tuiArgs += @("-Url", $Attach) }
+  $tuiArgs += @("-Title", "Task $([IO.Path]::GetFileNameWithoutExtension($TaskFile))")
   if ($FreshTui) { $tuiArgs += "-Fresh" }
   $tui = & powershell -NoProfile -File (Join-Path $PSScriptRoot "oc-tui.ps1") @tuiArgs
   $tui | ForEach-Object { Write-Output $_ }
   $line = $tui | Where-Object { $_ -match "^SESSION=" } | Select-Object -Last 1
   if (-not $line) { Write-Error "oc-tui.ps1 khong tra ve session id."; exit 6 }
   $Session = $line -replace "^SESSION=", ""
+  $urlLine = $tui | Where-Object { $_ -match "^URL=" } | Select-Object -Last 1
+  if ($urlLine) { $Attach = $urlLine -replace "^URL=", "" }
+  elseif ($Attach -eq "") { $Attach = "http://127.0.0.1:4096" }
 } else {
   Write-Output "TUI: tat theo yeu cau (-NoTui)"
 }
@@ -135,6 +188,8 @@ function Invoke-OpenCode($modelId, $variantName, $logPath) {
 }
 
 # ---------- luot chinh ----------
+# Chot chan cuoi: xac nhan lan nua phien/URL sap dung thuoc dung repo.
+if ($Attach -ne "") { Assert-SessionRepo $Attach $Session }
 $log = Join-Path $logDir "$base-$Tag.log"
 $r   = Invoke-OpenCode $Model $Variant $log
 $usedModel = $Model
