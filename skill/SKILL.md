@@ -66,7 +66,7 @@ Thang leo bậc khi review fail:
 3. Fail lần hai **dù brief đã chính xác** → mới leo sang bậc escalated.
 4. `attempts >= 3` → dừng, báo user (giữ nguyên luật cũ).
 
-Khi leo bậc bắt buộc chạy **thread mới, không `-Resume`**, và worktree phải sạch trước khi
+Khi leo bậc bắt buộc chạy **thread mới với `-FreshSession`**, và worktree phải sạch trước khi
 đổi model — thread cũ mang theo chuỗi suy luận hỏng, còn worktree đang chứa sửa dở của model
 trước; thả model mới đè lên thì không biết ai làm phần nào.
 
@@ -153,13 +153,19 @@ Gọi subagent `oc-coder` với đường dẫn brief. (Qua subagent để log O
 powershell -NoProfile -File .pipeline/bin/codex-run.ps1 -TaskFile .pipeline/tasks/<id>.md
 ```
 
-Task mới luôn tạo Codex thread mới. Mặc định runner mở **TUI gốc của Codex**
+Mỗi phiên Claude được gắn với **một Codex thread**. Lần giao task đầu tạo thread; các
+lần sau tự resume đúng thread đó, kể cả khi không truyền `-Resume`. Mặc định runner mở **TUI gốc của Codex**
 (`codex --approve-for-me -C <repo> "<prompt trỏ tới brief>"`) để người dùng thấy đúng
 giao diện Codex đang làm việc. `-Exec` hoặc `-NoTui` chạy headless (`codex exec`)
 **không cửa sổ**, dùng khi thư mục chưa được Codex tin cậy hoặc khi chạy tự động không
 ai ngồi xem. Thread
-ID được ghi theo cặp phiên Claude + task trong `.pipeline/codex-map.json` (file ignore)
-để lượt sửa lỗi resume đúng thread, không dùng `--last`.
+ID được ghi theo khóa `CLAUDE_CODE_HOST_SESSION_ID` (fallback
+`CLAUDE_CODE_SESSION_ID`) trong `.pipeline/codex-map.json` (file ignore), không dùng
+`--last`. Cửa sổ TUI cũ do runner mở được đóng trước khi mở TUI của lần giao mới, vì vậy
+chỉ có một cửa sổ Codex của pipeline trong mỗi repo tồn tại tại một thời điểm và nó luôn
+thuộc về phiên Claude vừa giao việc gần nhất. PID cửa sổ nằm cùng trong
+`.pipeline/codex-map.json`. Dùng `-FreshSession` khi thật sự cần bỏ lịch sử và tạo thread
+Codex mới (ví dụ lúc leo thang model).
 
 **Điều kiện của TUI gốc:** thư mục repo phải được Codex tin cậy
 (`~/.codex/config.toml`, mục `[projects.'...']` với `trust_level = "trusted"`). Thư mục

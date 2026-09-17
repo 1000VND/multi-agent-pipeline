@@ -81,8 +81,9 @@ powershell -NoProfile -File .pipeline\bin\oc-run.ps1    -TaskFile .pipeline\task
 powershell -NoProfile -File .pipeline\bin\codex-run.ps1 -TaskFile .pipeline\tasks\<id>.md
 ```
 
-Lượt sửa lỗi thêm `-Resume` để nối đúng phiên/thread của lượt trước. Brief phải **tự chứa**
-vì coder không thấy hội thoại này. Chi tiết quy trình nằm trong `SKILL.md` mà Claude đọc.
+`-Resume` vẫn dùng được cho lượt sửa lỗi tương thích với luồng cũ; bình thường runner Codex
+tự nối lại thread đã gắn với phiên Claude hiện tại. Brief phải **tự chứa** vì coder không
+thấy hội thoại này. Chi tiết quy trình nằm trong `SKILL.md` mà Claude đọc.
 
 ## pipeline.config.json
 
@@ -112,8 +113,9 @@ Cấm dùng `gpt-5.6-sol` và `gpt-6-astra` để implement code; runner Codex c
 
 ## Lane Codex
 
-- Mặc định runner mở **TUI Codex gốc** để người dùng nhìn thấy nó đang làm việc; cửa sổ ở
-  lại sau khi xong để đọc tiếp (runner in PID, đóng khi nào người dùng muốn).
+- Mỗi phiên Claude dùng đúng **một Codex thread**. Runner tự resume thread này ở task
+  sau và đóng TUI pipeline cũ của repo trước khi mở TUI mới, nên không tích nhiều cửa sổ Codex.
+  Dùng `-FreshSession` khi cần chủ động tạo thread mới.
 - `-Exec` hoặc `-NoTui` chạy headless, không mở cửa sổ nào.
 - TUI cần thư mục repo nằm trong danh sách tin cậy của Codex (`~/.codex/config.toml`, mục
   `[projects.'...']` với `trust_level = "trusted"`). Thư mục lạ thì TUI chặn lại hỏi xác

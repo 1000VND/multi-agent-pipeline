@@ -2,8 +2,9 @@
   codex-run.ps1 - Chay Codex CLI cho 1 task brief, ghi JSONL day du ra file,
   chi tra ve summary ngan cho Claude doc.
 
-  Task moi tao Codex thread moi. -Resume tiep tuc dung thread cua dung cap
-  phien Claude + task, tranh resume nham mot phien Codex khac.
+  Moi phien Claude gan voi dung mot Codex thread. Cac lan giao task sau tu
+  dong resume thread do; TUI cu duoc dong truoc khi mo lai de khong tich
+  nhieu cua so. -FreshSession chi dung khi can tach sang thread Codex moi.
 #>
 param(
   [Parameter(Mandatory = $true)][string]$TaskFile,
@@ -14,6 +15,7 @@ param(
   [string]$Session = "",
   [string]$Key = "",       # ghi de khoa phien Claude (chu yeu de test)
   [string]$TaskId = "",    # ghi de task id khi ten brief khong theo convention
+  [switch]$FreshSession,    # bo map hien tai, tao Codex thread moi cho phien Claude nay
   [switch]$NoTui,
   [switch]$Exec,           # duong lui: codex exec headless, khong cua so
   [int]$TimeoutSec = 0
@@ -91,7 +93,8 @@ if (-not (Test-Path $logDir)) { New-Item -ItemType Directory -Path $logDir | Out
 if ($Key -eq "") { $Key = $env:CLAUDE_CODE_HOST_SESSION_ID }
 if (-not $Key) { $Key = $env:CLAUDE_CODE_SESSION_ID }
 if (-not $Key) { $Key = "no-claude-session" }
-$mapKey = "${Key}::${TaskId}"
+$mapKey = $Key
+$tuiMapKey = "__pipeline_tui__" # ban ghi toan repo trong codex-map.json da duoc ignore
 
 function Read-Json($path) {
   if (-not (Test-Path $path)) { return $null }
@@ -112,12 +115,51 @@ function Save-Session($threadId, $tuiPid = $null) {
     codex_thread = $threadId
     claude_session_id = $env:CLAUDE_CODE_SESSION_ID
     session_key = $Key
-    task_id = $TaskId
+    last_task_id = $TaskId
     last_used = (Get-Date).ToString("s")
   }
   if ($tuiPid) { $record.tui_pid = [int]$tuiPid }
   $table[$mapKey] = $record
   $table | ConvertTo-Json -Depth 5 | Set-Content -Path $mapFile -Encoding UTF8
+}
+
+function Close-ManagedTui {
+  $table = Read-MapTable
+  if (-not $table.ContainsKey($tuiMapKey)) { return }
+  $win = $table[$tuiMapKey]
+  if (-not $win -or -not $win.pid) { return }
+  $oldPid = [int]$win.pid
+  $oldProc = Get-Process -Id $oldPid -ErrorAction SilentlyContinue
+  # Chi dong tien trinh Codex ma runner da ghi lai; PID Windows co the bi tai su dung.
+  if ($oldProc -and $oldProc.ProcessName -eq 'codex') {
+    & taskkill.exe /PID $oldPid /T /F | Out-Null
+    Write-Output "DONG CUA SO TUI CU (PID $oldPid) de chi con mot cua so Codex"
+  }
+  $table.Remove($tuiMapKey)
+  $table | ConvertTo-Json -Depth 5 | Set-Content -Path $mapFile -Encoding UTF8
+}
+
+function Save-ManagedTui($pid) {
+  $table = Read-MapTable
+  $table[$tuiMapKey] = @{ pid = [int]$pid; session_key = $Key; started = (Get-Date).ToString("s") }
+  $table | ConvertTo-Json -Depth 5 | Set-Content -Path $mapFile -Encoding UTF8
+}
+
+# Ban do cu dung khoa "<phien Claude>::<task>". Doc no mot lan de cac phien
+# dang do khong bi mat lich su, sau do Save-Session se chuyen no sang khoa moi.
+function Get-MappedSession {
+  $table = Read-MapTable
+  if ($table.ContainsKey($mapKey) -and $table[$mapKey].codex_thread) {
+    return [string]$table[$mapKey].codex_thread
+  }
+  $legacy = @(
+    $table.GetEnumerator() |
+      Where-Object { $_.Value.session_key -eq $Key -and $_.Value.codex_thread } |
+      Sort-Object { $_.Value.last_used } -Descending |
+      Select-Object -First 1
+  )
+  if ($legacy.Count -gt 0) { return [string]$legacy[0].Value.codex_thread }
+  return $null
 }
 
 function Get-EventValues($logPath) {
@@ -198,15 +240,23 @@ function Write-LogTail($logPath) {
   }
 }
 
-if ($Resume -and $Session -eq "") {
-  $table = Read-MapTable
-  if ($table.ContainsKey($mapKey)) { $Session = $table[$mapKey].codex_thread }
-  if (-not $Session) {
+if ($FreshSession) {
+  # Fresh co uu tien hon -Resume/-Session: day la loi thoat co chu dich cho
+  # escalation, khong duoc vo tinh quay lai chuoi suy luan cu.
+  $Session = ""
+  $Resume = $false
+}
+if ((-not $FreshSession) -and $Session -eq "") {
+  $Session = Get-MappedSession
+}
+if ($Resume -and -not $Session) {
     Write-Output "BLOCKED: khong co Codex thread da luu cho task $TaskId trong phien Claude nay."
     Write-Output "Dung -Session <thread-id> neu can resume mot thread cu cu the."
     exit 4
-  }
 }
+# -Resume giu tuong thich voi lenh cu. Con binh thuong, co map cua phien Claude
+# cung phai resume de tat ca task trong phien do dung chung mot Codex thread.
+if ($Session -and -not $FreshSession) { $Resume = $true }
 
 $head = & git rev-parse HEAD
 
@@ -239,24 +289,15 @@ if ($useTui) {
   # Trang thai worktree truoc khi chay, de biet luot nay co sua gi khong.
   $beforeStatus = (& git status --porcelain) -join "`n"
 
-  # Cua so TUI cu giu khoa thread; phai dong truoc khi resume cung thread do.
-  # Kiem ten tien trinh truoc khi giet: PID co the da bi cap lai cho viec khac.
-  if ($Resume) {
-    $table = Read-MapTable
-    if ($table.ContainsKey($mapKey) -and $table[$mapKey].tui_pid) {
-      $oldPid = [int]$table[$mapKey].tui_pid
-      $oldProc = Get-Process -Id $oldPid -ErrorAction SilentlyContinue
-      if ($oldProc -and $oldProc.ProcessName -eq 'codex') {
-        & taskkill.exe /PID $oldPid /T /F | Out-Null
-        Write-Output "DONG CUA SO TUI CU (PID $oldPid) de resume duoc thread nay"
-      }
-    }
-  }
+  # Moi repo chi giu mot cua so TUI do runner mo, bat ke no thuoc phien Claude
+  # nao. Phai dong no truoc khi resume/tao moi, neu khong Windows se tich cua so.
+  Close-ManagedTui
 
   $t0 = Get-Date
   $t0Utc = $t0.ToUniversalTime().ToString("yyyy-MM-dd'T'HH:mm:ss.fff'Z'")
   $sw = [Diagnostics.Stopwatch]::StartNew()
   $tuiProc = Start-Process -FilePath $codexExe -ArgumentList $tuiArgsQuoted -PassThru
+  Save-ManagedTui $tuiProc.Id
   # PS 5.1 chi doc duoc $tuiProc.ExitCode neu handle duoc giu truoc khi tien trinh thoat.
   [void]$tuiProc.Handle
 
@@ -336,7 +377,7 @@ if ($useTui) {
   if (-not $threadId) { $threadId = Get-NativeThreadId $log }
   if ($threadId) { Save-Session $threadId $tuiProc.Id }
   $code = 0
-  Write-Output "CUA SO TUI VAN MO (PID $($tuiProc.Id)) - dong khi nao ban muon"
+  Write-Output "CUA SO TUI DANG MO (PID $($tuiProc.Id)) - luot sau se tu dong dong va mo lai cung thread"
 } else {
   # ------------- duong lui: codex exec headless (nhu truoc) -------------
   $log = Join-Path $logDir "$base-$Tag-codex.jsonl"

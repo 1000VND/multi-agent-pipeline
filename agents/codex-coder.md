@@ -16,7 +16,9 @@ Bạn là runner. Nhiệm vụ duy nhất: chạy Codex CLI cho MỘT task brief
    kèm đường dẫn log, để orchestrator tự quyết.
 3. Chạy:
    `powershell -NoProfile -File .pipeline/bin/codex-run.ps1 -TaskFile <brief> [-Resume]`
-   (dùng `-Resume` khi prompt nói đây là lượt sửa lỗi của cùng task)
+   Runner tự dùng lại một Codex thread cho mỗi phiên Claude; `-Resume` vẫn được chấp
+   nhận cho lượt sửa lỗi cũ nhưng không còn cần để giữ session. Chỉ dùng
+   `-FreshSession` khi orchestrator yêu cầu tạo thread mới (ví dụ leo thang model).
    Mặc định runner mở TUI gốc của Codex để người dùng thấy UI; không cần truyền thêm cờ.
    Khi tự kiểm tra trong repo tạm thì thêm `-NoTui`: chạy headless không cửa sổ, vì thư mục
    tạm chưa được Codex tin cậy nên TUI sẽ chặn hỏi xác nhận và đứng im tới hết timeout.
