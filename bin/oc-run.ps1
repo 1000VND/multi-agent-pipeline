@@ -111,26 +111,27 @@ function Assert-SessionRepo($attachUrl, $sid) {
 # Nguoi goi ghim san -Attach/-Session: kiem ngay truoc khi mo TUI.
 if (($Attach -ne "") -and ($Session -ne "")) { Assert-SessionRepo $Attach $Session }
 
-# TUI bat mac dinh: dong cua so TUI cu, lay/tao phien opencode cua phien Claude nay,
-# mo cua so CMD moi ghim vao no. Tat bang -NoTui; -NewTui chi con la co cu.
-# -Attach chi duoc truyen tiep khi nguoi goi chi dinh ro; khong thi de oc-tui
-# tu tim server dung cua repo (moi repo mot server, cong 4096-4105).
-if (-not $NoTui) {
-  $tuiArgs = @()
-  if ($Attach -ne "") { $tuiArgs += @("-Url", $Attach) }
-  $tuiArgs += @("-Title", "Task $([IO.Path]::GetFileNameWithoutExtension($TaskFile))")
-  if ($FreshTui) { $tuiArgs += "-Fresh" }
-  $tui = & powershell -NoProfile -File (Join-Path $PSScriptRoot "oc-tui.ps1") @tuiArgs
-  $tui | ForEach-Object { Write-Output $_ }
-  $line = $tui | Where-Object { $_ -match "^SESSION=" } | Select-Object -Last 1
-  if (-not $line) { Write-Error "oc-tui.ps1 khong tra ve session id."; exit 6 }
-  $Session = $line -replace "^SESSION=", ""
-  $urlLine = $tui | Where-Object { $_ -match "^URL=" } | Select-Object -Last 1
-  if ($urlLine) { $Attach = $urlLine -replace "^URL=", "" }
-  elseif ($Attach -eq "") { $Attach = "http://127.0.0.1:4096" }
-} else {
-  Write-Output "TUI: tat theo yeu cau (-NoTui)"
+# Luon lay/tao session truoc khi giao task. Headless chi bo qua viec mo CMD,
+# van in lenh attach de nguoi dung co the mo lai TUI sau khi da dong nham.
+$tuiArgs = @()
+if ($Attach -ne "") { $tuiArgs += @("-Url", $Attach) }
+$tuiArgs += @("-Title", "Task $([IO.Path]::GetFileNameWithoutExtension($TaskFile))")
+if ($FreshTui) { $tuiArgs += "-Fresh" }
+if ($NoTui) { $tuiArgs += "-NoWindow" }
+$tui = & powershell -NoProfile -File (Join-Path $PSScriptRoot "oc-tui.ps1") @tuiArgs
+$tui | ForEach-Object { Write-Output $_ }
+$line = $tui | Where-Object { $_ -match "^SESSION=" } | Select-Object -Last 1
+if (-not $line) { Write-Error "oc-tui.ps1 khong tra ve session id."; exit 6 }
+$Session = $line -replace "^SESSION=", ""
+$urlLine = $tui | Where-Object { $_ -match "^URL=" } | Select-Object -Last 1
+if ($urlLine) { $Attach = $urlLine -replace "^URL=", "" }
+elseif ($Attach -eq "") { $Attach = "http://127.0.0.1:4096" }
+
+$tuiHint = "opencode attach $Attach -s $Session"
+if ($NoTui) {
+  Write-Output "MODE: headless (khong mo cua so)"
 }
+Write-Output "TUI: $tuiHint"
 
 $base = [IO.Path]::GetFileNameWithoutExtension($TaskFile)
 if ($Tag -eq "") { $Tag = (Get-Date -Format "HHmmss") }
@@ -143,6 +144,17 @@ $prompt    = Get-Content -Raw -Encoding UTF8 -Path $TaskFile
 # se bi tach thanh nhieu argv va opencode in help roi thoat. Nhan doi backslash
 # dung truoc roi escape dau nhay theo quy uoc dong lenh Windows.
 $promptArg = $prompt -replace '(\\*)"', '$1$1\"'
+
+# npm cai ca opencode.ps1 va opencode.cmd. Tren mot so ban Windows/Bun,
+# shim .ps1 co the loi EEXIST luc khoi dong trong khi shim .cmd van chay
+# binh thuong. Ep dung .cmd de runner khop voi lenh opencode trong CMD.
+$openCodeCmd = Get-Command "opencode.cmd" -CommandType Application -ErrorAction SilentlyContinue |
+  Select-Object -First 1
+if (-not $openCodeCmd) {
+  Write-Output "LOI: khong tim thay opencode.cmd trong PATH. Mo CMD, chay 'opencode --version', roi cai/sua PATH cua OpenCode."
+  exit 7
+}
+$openCodePath = $openCodeCmd.Source
 
 # opencode in usage/help khi prompt khong toi noi nguyen ven -> nhan dien de khong dot fallback.
 function Test-ArgError($logPath) {
@@ -161,10 +173,7 @@ function Invoke-OpenCode($modelId, $variantName, $logPath) {
 
   $label = if ($variantName -ne "") { "$modelId (variant $variantName)" } else { $modelId }
   Write-Output "=> opencode $label | task=$base | log=$logPath"
-  if ($Attach -ne "") {
-    $watch = if ($Session -ne "") { "opencode attach $Attach -s $Session" } else { "opencode attach $Attach -c" }
-    Write-Output "   xem live: $watch"
-  }
+  if ($Attach -ne "") { Write-Output "   xem live: $tuiHint" }
 
   $sw = [Diagnostics.Stopwatch]::StartNew()
   # Job tu ghi PID cua no ra file trong TEMP de cha biet duong giet ca cay khi
@@ -172,12 +181,12 @@ function Invoke-OpenCode($modelId, $variantName, $logPath) {
   $pidFile = Join-Path $env:TEMP ("oc-run-{0}-{1}.pid" -f $Tag, [guid]::NewGuid().ToString("N").Substring(0, 8))
   # stdout+stderr -> file. Timeout bang job de khong treo session.
   $job = Start-Job -ScriptBlock {
-    param($a, $l, $cwd, $pf)
+    param($a, $l, $cwd, $pf, $exe)
     Set-Content -Path $pf -Value $PID
     Set-Location $cwd
-    & opencode @a *>&1 | Out-File -FilePath $l -Encoding utf8
+    & $exe @a *>&1 | Out-File -FilePath $l -Encoding utf8
     $LASTEXITCODE
-  } -ArgumentList $ocArgs, $logPath, $repo, $pidFile
+  } -ArgumentList $ocArgs, $logPath, $repo, $pidFile, $openCodePath
 
   if (-not (Wait-Job $job -Timeout $TimeoutSec)) {
     # Stop-Job chi giet job PowerShell, opencode.exe ma job de ra van song tiep.
@@ -258,8 +267,11 @@ if ($changed) {
     $ErrorActionPreference = "Continue"
     try {
       # 2>&1 phai nam trong chuoi IEX: redirect ben ngoai khong bat duoc stderr cua lenh native.
+      $LASTEXITCODE = 0
       $testsText = (Invoke-Expression ($testCommand + " 2>&1") | Out-String)
+      $testExitCode = $LASTEXITCODE
       $testsRan  = $true
+      if ($testExitCode -ne 0) { $testsFailed = $true }
     } catch {
       $testsRan = $false
     }

@@ -69,15 +69,6 @@ if ($forbiddenModels -contains $Model) {
   exit 2
 }
 
-# Task moi can worktree sach de git diff chi chua thay doi cua coder vua chay.
-# Luot -Resume duoc phep nhin thay thay doi dang sua cua chinh task do.
-$dirty = & git status --porcelain
-if ($dirty -and -not $Resume) {
-  Write-Output "BLOCKED: worktree chua sach. Commit hoac stash truoc khi giao task."
-  Write-Output $dirty
-  exit 3
-}
-
 $taskPath = (Resolve-Path $TaskFile).Path
 $base = [IO.Path]::GetFileNameWithoutExtension($taskPath)
 if ($TaskId -eq "") {
@@ -90,9 +81,153 @@ $logDir = Join-Path $stateDir "logs"
 $mapFile = Join-Path $stateDir "codex-map.json"
 if (-not (Test-Path $logDir)) { New-Item -ItemType Directory -Path $logDir | Out-Null }
 
+# ---------- run lock theo repo ----------
+# Chi mot codex-run.ps1 duoc phep chay trong moi repo: luot sau phai thoat truoc
+# khi kip dong TUI ma luot truoc dang can. Lock nam trong .pipeline/logs (da duoc
+# ignore san) nen khong bao gio hien ra nhu mot thay doi Git cua repo dich.
+$runLock = Join-Path $logDir "codex-run.lock"
+$script:runLockAcquired = $false
+$script:preserveRunLock = $false
+
+function Get-RunLockOwner {
+  if (-not (Test-Path $runLock)) { return $null }
+  try { return (Get-Content -Raw -Encoding UTF8 $runLock | ConvertFrom-Json) } catch { return $null }
+}
+
+function Test-RunLockOwnerAlive($owner) {
+  if (-not $owner) { return $false }
+  $ownerPid = 0
+  if (-not [int]::TryParse(([string]$owner.pid), [ref]$ownerPid) -or $ownerPid -le 0) { return $false }
+  $proc = Get-Process -Id $ownerPid -ErrorAction SilentlyContinue
+  if (-not $proc) { return $false }
+  # PID Windows co the bi tai su dung: so ca thoi diem khoi dong voi ban ghi.
+  if ($owner.started) {
+    try { return ($proc.StartTime.ToUniversalTime().ToString("o") -eq [string]$owner.started) } catch { return $true }
+  }
+  return $true
+}
+
+function Acquire-RunLock {
+  $myStarted = (Get-Process -Id $PID).StartTime.ToUniversalTime().ToString("o")
+  $payload = @{ pid = $PID; started = $myStarted } | ConvertTo-Json -Compress
+  for ($attempt = 0; $attempt -lt 4; $attempt++) {
+    # Ghi ra file tam roi doi ten vao dich: lock luon xuat hien voi noi dung day
+    # du, va chi mot tien trinh doi ten duoc (Move khong ghi de).
+    $tmp = "{0}.{1}.{2}.tmp" -f $runLock, $PID, [guid]::NewGuid().ToString("N").Substring(0, 8)
+    try {
+      [IO.File]::WriteAllText($tmp, $payload, [Text.UTF8Encoding]::new($false))
+      [IO.File]::Move($tmp, $runLock)
+      $script:runLockAcquired = $true
+      return
+    } catch {
+      Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue
+    }
+    $owner = Get-RunLockOwner
+    if (Test-RunLockOwnerAlive $owner) {
+      Write-Output "BLOCKED: mot runner Codex khac dang chay trong repo nay (PID $($owner.pid)). Cho luot do xong roi chay lai; khong dong TUI cua no."
+      return
+    }
+    # Chu lock da chet: doi ten ban ghi cu ra ten rieng de chi mot runner thu hoi
+    # duoc, tranh hai runner cung xoa roi cung tao de len nhau.
+    $reclaim = "{0}.stale-{1}-{2}" -f $runLock, $PID, [guid]::NewGuid().ToString("N").Substring(0, 8)
+    try {
+      [IO.File]::Move($runLock, $reclaim)
+      Remove-Item -LiteralPath $reclaim -Force -ErrorAction SilentlyContinue
+    } catch { }
+  }
+  # Fail closed: khong bao gio chay ma khong co lock, du lock hong kieu gi.
+  Write-Output "BLOCKED: khong gianh duoc run lock ($runLock). Khong chay khi chua co lock de tranh hai runner Codex chong nhau; kiem tra file/thu muc lock roi chay lai."
+}
+
+function Release-RunLock {
+  # Timeout ma khong giet duoc Codex thi lock da duoc chuyen sang PID Codex.
+  # Khong xoa no khi runner nay thoat, neu khong luot sau se chong len tien trinh cu.
+  if ($script:preserveRunLock) { return }
+  $owner = Get-RunLockOwner
+  if (-not $owner) { return }
+  $ownerPid = 0
+  if (-not [int]::TryParse(([string]$owner.pid), [ref]$ownerPid) -or $ownerPid -ne $PID) { return }
+  # Khong bao gio xoa lock khong phai cua chinh tien trinh nay.
+  if ($owner.started) {
+    try {
+      if ([string]$owner.started -ne (Get-Process -Id $PID).StartTime.ToUniversalTime().ToString("o")) { return }
+    } catch { return }
+  }
+  Remove-Item -LiteralPath $runLock -Force -ErrorAction SilentlyContinue
+}
+
+# taskkill co the that bai (vd tien trinh o session/permission khac). Khi do chuyen
+# lock tu runner sang Codex dang con song. Runner sau se thay PID Codex va dung cho
+# den khi tien trinh cu thuc su ket thuc, thay vi mo them mot TUI de chong len no.
+function Preserve-RunLockForProcess($proc) {
+  if (-not $proc) { return $false }
+  $child = Get-Process -Id $proc.Id -ErrorAction SilentlyContinue
+  if (-not $child) { return $false }
+  $childStarted = Get-ProcessStartTime $child
+  if (-not $childStarted) { return $false }
+
+  $owner = Get-RunLockOwner
+  $ownerPid = 0
+  if (-not $owner -or -not [int]::TryParse(([string]$owner.pid), [ref]$ownerPid) -or $ownerPid -ne $PID) {
+    return $false
+  }
+
+  $payload = @{ pid = $child.Id; started = $childStarted; retained_for = "codex-timeout" } |
+    ConvertTo-Json -Compress
+  $tmp = "{0}.{1}.{2}.tmp" -f $runLock, $PID, [guid]::NewGuid().ToString("N").Substring(0, 8)
+  try {
+    [IO.File]::WriteAllText($tmp, $payload, [Text.UTF8Encoding]::new($false))
+    try {
+      # Replace la atomic tren NTFS; fallback chi dung khi filesystem khong ho tro.
+      [IO.File]::Replace($tmp, $runLock, $null)
+    } catch {
+      [IO.File]::WriteAllText($runLock, $payload, [Text.UTF8Encoding]::new($false))
+      Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue
+    }
+    $script:preserveRunLock = $true
+    return $true
+  } catch {
+    Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue
+    return $false
+  }
+}
+
+# taskkill ghi loi ra stderr; voi ErrorActionPreference=Stop phai ha tam xuong
+# Continue de loi kill khong lam vo timeout/cleanup va che mat trang thai that.
+function Stop-ManagedProcessTree($targetPid) {
+  $previousEAP = $ErrorActionPreference
+  $ErrorActionPreference = "Continue"
+  try {
+    & taskkill.exe /PID $targetPid /T /F 2>&1 | Out-Null
+    return $LASTEXITCODE
+  } finally {
+    $ErrorActionPreference = $previousEAP
+  }
+}
+
+Acquire-RunLock
+if (-not $script:runLockAcquired) { exit 10 }
+
+try {
+
+# Task moi can worktree sach de git diff chi chua thay doi cua coder vua chay.
+# Luot -Resume duoc phep nhin thay thay doi dang sua cua chinh task do.
+$dirty = & git status --porcelain
+if ($dirty -and -not $Resume) {
+  Write-Output "BLOCKED: worktree chua sach. Commit hoac stash truoc khi giao task."
+  Write-Output $dirty
+  exit 3
+}
+
+# -Key la duong ghi de cho nguoi goi ngoai Claude Code. Khong co ca ba nguon thi
+# khong the gan Codex thread vao dung phien; dung chung mot khoa se tron lich su
+# cua nhieu lan chay khac nhau nen phai tu choi chay.
 if ($Key -eq "") { $Key = $env:CLAUDE_CODE_HOST_SESSION_ID }
 if (-not $Key) { $Key = $env:CLAUDE_CODE_SESSION_ID }
-if (-not $Key) { $Key = "no-claude-session" }
+if (-not $Key) {
+  Write-Output "BLOCKED: khong xac dinh duoc phien Claude (CLAUDE_CODE_HOST_SESSION_ID/CLAUDE_CODE_SESSION_ID deu trong). Chay ngoai Claude Code thi truyen -Key <ten-phien> de khong tron lich su Codex."
+  exit 11
+}
 $mapKey = $Key
 $tuiMapKey = "__pipeline_tui__" # ban ghi toan repo trong codex-map.json da duoc ignore
 
@@ -123,6 +258,12 @@ function Save-Session($threadId, $tuiPid = $null) {
   $table | ConvertTo-Json -Depth 5 | Set-Content -Path $mapFile -Encoding UTF8
 }
 
+# Thoi diem khoi dong tien trinh (UTC, round-trip) de phan biet PID bi tai su
+# dung; tra ve $null neu khong doc duoc.
+function Get-ProcessStartTime($proc) {
+  try { return $proc.StartTime.ToUniversalTime().ToString("o") } catch { return $null }
+}
+
 function Close-ManagedTui {
   $table = Read-MapTable
   if (-not $table.ContainsKey($tuiMapKey)) { return }
@@ -130,18 +271,44 @@ function Close-ManagedTui {
   if (-not $win -or -not $win.pid) { return }
   $oldPid = [int]$win.pid
   $oldProc = Get-Process -Id $oldPid -ErrorAction SilentlyContinue
-  # Chi dong tien trinh Codex ma runner da ghi lai; PID Windows co the bi tai su dung.
+  # Chi dong tien trinh Codex ma runner da ghi lai; PID Windows co the bi tai su
+  # dung nen phai khop ca ten tien trinh lan thoi diem khoi dong.
   if ($oldProc -and $oldProc.ProcessName -eq 'codex') {
-    & taskkill.exe /PID $oldPid /T /F | Out-Null
-    Write-Output "DONG CUA SO TUI CU (PID $oldPid) de chi con mot cua so Codex"
+    if (-not $win.proc_started) {
+      # Ban ghi cu (truoc O2) khong co thoi diem khoi dong: khong du can cu de
+      # giet, co the trung PID voi phien Codex khac cua nguoi dung. Bo qua ban
+      # ghi va de nguoi dung tu dong cua so cu.
+      Write-Output "CANH BAO: ban ghi TUI cu (PID $oldPid) khong co thoi diem khoi dong - khong dong de tranh giet nham; cua so cu co the con mo"
+    } else {
+      $actual = Get-ProcessStartTime $oldProc
+      if ($actual -and ($actual -eq [string]$win.proc_started)) {
+        [void](Stop-ManagedProcessTree $oldPid)
+        $waitStop = [Diagnostics.Stopwatch]::StartNew()
+        while ((Get-Process -Id $oldPid -ErrorAction SilentlyContinue) -and $waitStop.Elapsed.TotalSeconds -lt 5) {
+          Start-Sleep -Milliseconds 200
+        }
+        if (Get-Process -Id $oldPid -ErrorAction SilentlyContinue) {
+          Write-Output "BLOCKED: khong dong duoc TUI Codex cu (PID $oldPid). Khong mo TUI moi de tranh hai phien chong nhau; dong PID nay thu cong roi chay lai."
+          exit 10
+        }
+        Write-Output "DONG CUA SO TUI CU (PID $oldPid) de chi con mot cua so Codex"
+      }
+      # Thoi diem khoi dong khac => PID da bi tai su dung, khong giet.
+    }
   }
   $table.Remove($tuiMapKey)
   $table | ConvertTo-Json -Depth 5 | Set-Content -Path $mapFile -Encoding UTF8
 }
 
-function Save-ManagedTui($pid) {
+function Save-ManagedTui($tuiProcessId) {
   $table = Read-MapTable
-  $table[$tuiMapKey] = @{ pid = [int]$pid; session_key = $Key; started = (Get-Date).ToString("s") }
+  $record = @{ pid = [int]$tuiProcessId; session_key = $Key; started = (Get-Date).ToString("s") }
+  $proc = Get-Process -Id $tuiProcessId -ErrorAction SilentlyContinue
+  if ($proc) {
+    $procStart = Get-ProcessStartTime $proc
+    if ($procStart) { $record.proc_started = $procStart }
+  }
+  $table[$tuiMapKey] = $record
   $table | ConvertTo-Json -Depth 5 | Set-Content -Path $mapFile -Encoding UTF8
 }
 
@@ -258,6 +425,10 @@ if ($Resume -and -not $Session) {
 # cung phai resume de tat ca task trong phien do dung chung mot Codex thread.
 if ($Session -and -not $FreshSession) { $Resume = $true }
 
+function Write-TuiResumeHint($threadId) {
+  if ($threadId) { Write-Output "TUI: codex resume $threadId" }
+}
+
 $head = & git rev-parse HEAD
 
 # Mac dinh la TUI goc cua Codex. -Exec hoac -NoTui quay ve duong codex exec.
@@ -302,7 +473,14 @@ if ($useTui) {
   [void]$tuiProc.Handle
 
   # Doi rollout cua dung phien (cwd phai khop), roi doi task_complete trong do.
-  $sessionsRoot = Join-Path $env:USERPROFILE ".codex\sessions"
+  # Codex co the dung profile rieng qua CODEX_HOME; USERPROFILE chi la mac dinh.
+  $codexHome = [string]$env:CODEX_HOME
+  if (-not $codexHome) {
+    $profileHome = [string]$env:USERPROFILE
+    if (-not $profileHome) { $profileHome = [Environment]::GetFolderPath("UserProfile") }
+    $codexHome = Join-Path $profileHome ".codex"
+  }
+  $sessionsRoot = Join-Path $codexHome "sessions"
   $repoNorm = $repo.Replace('/', '\').TrimEnd('\')
   $rollout = $null
   $warnedNoRollout = $false
@@ -357,15 +535,23 @@ if ($useTui) {
     }
     if ($sw.Elapsed.TotalSeconds -ge $TimeoutSec) {
       # Chi giet khi con song: taskkill vao PID da chet chi in rac ra output.
+      $stopped = $tuiProc.HasExited
       if (-not $tuiProc.HasExited) {
         # Stop-Process khong du: TUI de tien trinh con, phai giet ca cay.
-        & taskkill.exe /PID $tuiProc.Id /T /F | Out-Null
+        [void](Stop-ManagedProcessTree $tuiProc.Id)
         $waitStop = [Diagnostics.Stopwatch]::StartNew()
         while (-not $tuiProc.HasExited -and $waitStop.Elapsed.TotalSeconds -lt 5) { Start-Sleep -Milliseconds 200 }
+        $stopped = $tuiProc.HasExited
       }
       $sw.Stop()
       if ($threadId) { Save-Session $threadId $tuiProc.Id }
-      Write-Output "TIMEOUT sau ${TimeoutSec}s - da giet TUI PID $($tuiProc.Id)"
+      if ($stopped) {
+        Write-Output "TIMEOUT sau ${TimeoutSec}s - da giet TUI PID $($tuiProc.Id)"
+      } elseif (Preserve-RunLockForProcess $tuiProc) {
+        Write-Output "TIMEOUT sau ${TimeoutSec}s - KHONG giet duoc TUI PID $($tuiProc.Id); giu run lock den khi no tu thoat"
+      } else {
+        Write-Output "TIMEOUT sau ${TimeoutSec}s - KHONG giet duoc TUI PID $($tuiProc.Id), va KHONG the giu run lock; can dong tien trinh nay thu cong truoc khi chay lai"
+      }
       exit 124
     }
     Start-Sleep -Seconds 2
@@ -402,6 +588,11 @@ if ($useTui) {
 
   # -Exec va -NoTui deu chay headless, khong mo cua so nao.
   Write-Output "MODE: headless (khong mo cua so) - dung mac dinh de thay TUI Codex goc"
+  if ($Session) {
+    Write-TuiResumeHint $Session
+  } else {
+    Write-Output "TUI: se in lenh codex resume sau khi Codex tao thread moi"
+  }
 
   # PS 5.1 noi cac phan tu -ArgumentList bang dau cach va khong tu boc nhay;
   # tham so co khoang trang (vd --cd <duong dan>) phai duoc boc nhay san.
@@ -435,13 +626,22 @@ if ($useTui) {
     }
     if ($sw.Elapsed.TotalSeconds -ge $TimeoutSec) {
       # Stop-Process khong du: codex de tien trinh con, phai giet ca cay.
-      & taskkill.exe /PID $proc.Id /T /F | Out-Null
+      [void](Stop-ManagedProcessTree $proc.Id)
       $waitStop = [Diagnostics.Stopwatch]::StartNew()
       while (-not $proc.HasExited -and $waitStop.Elapsed.TotalSeconds -lt 5) { Start-Sleep -Milliseconds 200 }
       $sw.Stop()
       $threadId = Get-ThreadId $log
-      if ($threadId) { Save-Session $threadId }
-      Write-Output "TIMEOUT sau ${TimeoutSec}s - da giet codex PID $($proc.Id) - xem log: $log"
+      if ($threadId) {
+        Save-Session $threadId
+        if ($threadId -ne $Session) { Write-TuiResumeHint $threadId }
+      }
+      if ($proc.HasExited) {
+        Write-Output "TIMEOUT sau ${TimeoutSec}s - da giet codex PID $($proc.Id) - xem log: $log"
+      } elseif (Preserve-RunLockForProcess $proc) {
+        Write-Output "TIMEOUT sau ${TimeoutSec}s - KHONG giet duoc codex PID $($proc.Id); giu run lock den khi no tu thoat - xem log: $log"
+      } else {
+        Write-Output "TIMEOUT sau ${TimeoutSec}s - KHONG giet duoc codex PID $($proc.Id), va KHONG the giu run lock; can dong tien trinh nay thu cong truoc khi chay lai - xem log: $log"
+      }
       exit 124
     }
     Start-Sleep -Seconds 1
@@ -457,6 +657,7 @@ if ($useTui) {
   $threadId = Get-ThreadId $log
   if ($threadId) {
     Save-Session $threadId
+    if ($threadId -ne $Session) { Write-TuiResumeHint $threadId }
   } elseif ($Resume -and $Session -and $code -eq 0) {
     Save-Session $Session
   }
@@ -499,8 +700,11 @@ if ($changed) {
     $ErrorActionPreference = "Continue"
     try {
       # 2>&1 phai nam trong chuoi IEX: redirect ben ngoai khong bat duoc stderr cua lenh native.
+      $LASTEXITCODE = 0
       $testsText = (Invoke-Expression ($testCommand + " 2>&1") | Out-String)
+      $testExitCode = $LASTEXITCODE
       $testsRan = $true
+      if ($testExitCode -ne 0) { $testsFailed = $true }
     } catch {
       $testsRan = $false
     }
@@ -550,3 +754,8 @@ if ($useTui) {
 } elseif (($code -ne 0) -and (-not $didWork)) { exit 7 }
 if (-not $didWork) { exit 5 }
 exit 0
+
+} finally {
+  # Moi duong thoat (exit thuong, exit loi, timeout) deu phai tra run lock.
+  if ($script:runLockAcquired) { Release-RunLock }
+}

@@ -118,6 +118,8 @@ Nếu worktree bẩn: **dừng, hỏi user**. Không tự `git stash`, không t�
 powershell -NoProfile -File .pipeline/bin/oc-run.ps1 -TaskFile .pipeline/tasks/<id>.md
 ```
 
+Sau khi runner trả URL/session, luôn chuyển nguyên dòng `TUI: opencode attach <URL> -s <session-id>` cho người dùng. Với `-NoTui`, runner không mở CMD nhưng vẫn cấp session và in dòng này để người dùng tự mở lại TUI. `--auto` là cờ quyền tự duyệt, không phải chế độ hiển thị.
+
 Nó đóng cửa sổ CMD đang mở, rồi **tra bản đồ phiên Claude → phiên opencode**:
 
 - Phiên Claude này đã có phiên opencode và phiên đó còn sống → **dùng lại**, giữ nguyên lịch sử
@@ -159,13 +161,28 @@ lần sau tự resume đúng thread đó, kể cả khi không truyền `-Resume
 giao diện Codex đang làm việc. `-Exec` hoặc `-NoTui` chạy headless (`codex exec`)
 **không cửa sổ**, dùng khi thư mục chưa được Codex tin cậy hoặc khi chạy tự động không
 ai ngồi xem. Thread
-ID được ghi theo khóa `CLAUDE_CODE_HOST_SESSION_ID` (fallback
-`CLAUDE_CODE_SESSION_ID`) trong `.pipeline/codex-map.json` (file ignore), không dùng
-`--last`. Cửa sổ TUI cũ do runner mở được đóng trước khi mở TUI của lần giao mới, vì vậy
-chỉ có một cửa sổ Codex của pipeline trong mỗi repo tồn tại tại một thời điểm và nó luôn
-thuộc về phiên Claude vừa giao việc gần nhất. PID cửa sổ nằm cùng trong
-`.pipeline/codex-map.json`. Dùng `-FreshSession` khi thật sự cần bỏ lịch sử và tạo thread
-Codex mới (ví dụ lúc leo thang model).
+ID được ghi theo khóa `-Key` (nếu truyền), rồi `CLAUDE_CODE_HOST_SESSION_ID`, rồi
+`CLAUDE_CODE_SESSION_ID` trong `.pipeline/codex-map.json` (file ignore), không dùng
+`--last`. Chạy ngoài Claude Code phải truyền `-Key`; thiếu cả ba nguồn thì runner in
+`BLOCKED:` và thoát mã `11` chứ không gộp lịch sử vào một key chung. Cửa sổ TUI cũ do
+runner mở được đóng trước khi mở TUI của lần giao mới, vì vậy chỉ có một cửa sổ Codex của
+pipeline trong mỗi repo tồn tại tại một thời điểm và nó luôn thuộc về phiên Claude vừa
+giao việc gần nhất. Bản đồ TUI lưu cả PID lẫn thời điểm khởi động của tiến trình; runner
+chỉ đóng khi PID còn sống, đúng tên `codex` và đúng thời điểm khởi động, còn bản ghi cũ
+thiếu thời điểm khởi động thì bỏ qua để không giết nhầm PID đã bị tái sử dụng. Dùng
+`-FreshSession` khi thật sự cần bỏ lịch sử và tạo thread Codex mới (ví dụ lúc leo thang model).
+Khi headless có thread, runner in `TUI: codex resume <thread-id>`; chuyển nguyên dòng này cho người dùng để họ tự mở lại đúng TUI.
+
+Việc đóng TUI cũ rồi mở TUI mới chỉ an toàn khi các lượt chạy **tuần tự**, nên runner
+giữ một **run lock theo repo** tại `.pipeline/logs/codex-run.lock` (đã ignore). Lượt thứ
+hai chồng lên sẽ thoát ngay với `BLOCKED: ... (PID ...)` thay vì đóng nhầm TUI mà lượt
+đang chạy còn cần; lock của tiến trình đã chết được tự thu hồi, còn lock của tiến trình
+còn sống thì không ai được xóa. Lock không thu hồi được vì lý do khác (file lock hỏng,
+không truy cập được) cũng làm runner `exit 10` chứ **không chạy không lock**. Gặp thông
+báo này hãy chờ lượt kia xong rồi chạy lại, không tự tắt tiến trình/TUI của PID đó.
+Nếu runner không đóng được TUI cũ đã quản lý thì nó cũng `exit 10`, không mở thêm TUI.
+Khi timeout mà `taskkill` không giết được Codex, lock được chuyển sang PID Codex còn
+sống; lượt sau bị chặn đến khi tiến trình đó kết thúc hoặc người dùng đóng thủ công.
 
 **Điều kiện của TUI gốc:** thư mục repo phải được Codex tin cậy
 (`~/.codex/config.toml`, mục `[projects.'...']` với `trust_level = "trusted"`). Thư mục
@@ -182,8 +199,9 @@ không phụ thuộc `~/.codex/config.toml` của máy nữa; chỉ đổi khi l
 output trả về Claude chỉ có diffstat, kết quả test và final message. Gọi subagent
 `codex-coder` với đường dẫn brief.
 
-Khi timeout, runner giết cả cây tiến trình Codex/TUI bằng `taskkill /T /F` chứ không
-buông tay. Thread id được lưu vào `codex-map.json` ngay khi nhận ra (TUI: từ rollout,
+Khi timeout, runner thử giết cả cây tiến trình Codex/TUI bằng `taskkill /T /F`. Nếu
+không giết được, nó giữ run lock theo PID còn sống thay vì buông tay. Thread id được lưu
+vào `codex-map.json` ngay khi nhận ra (TUI: từ rollout,
 exec: khi `thread.started` xuất hiện), nên `-Resume` vẫn dùng được kể cả khi lượt trước
 chết giữa chừng. Ở chế độ `-Exec`, stderr của Codex nằm ở file `<log>.err` cạnh file
 JSONL; ở chế độ TUI, rollout được sao chép vào `.pipeline/logs/<base>-<tag>-native.jsonl`.

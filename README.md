@@ -116,7 +116,24 @@ Cấm dùng `gpt-5.6-sol` và `gpt-6-astra` để implement code; runner Codex c
 - Mỗi phiên Claude dùng đúng **một Codex thread**. Runner tự resume thread này ở task
   sau và đóng TUI pipeline cũ của repo trước khi mở TUI mới, nên không tích nhiều cửa sổ Codex.
   Dùng `-FreshSession` khi cần chủ động tạo thread mới.
+- Danh tính phiên lấy theo thứ tự `-Key`, `CLAUDE_CODE_HOST_SESSION_ID`,
+  `CLAUDE_CODE_SESSION_ID`. Thiếu cả ba thì runner in `BLOCKED:` và thoát `11` thay vì
+  gộp các lần chạy khác nhau vào một key chung (không còn key `no-claude-session`).
+- Bản đồ TUI lưu cả PID lẫn thời điểm khởi động của tiến trình; runner chỉ đóng TUI khi
+  PID còn sống, đúng tên `codex` và đúng thời điểm khởi động. Bản ghi cũ thiếu thời điểm
+  khởi động bị bỏ qua (cửa sổ cũ có thể còn mở) thay vì giết nhầm PID đã bị tái sử dụng.
+- Mỗi repo chỉ chạy một `codex-run.ps1` tại một thời điểm nhờ **run lock** theo repo
+  (`.pipeline/logs/codex-run.lock`, đã ignore). Lượt chồng lên thoát ngay với
+  `BLOCKED: ... (PID ...)` và không đụng TUI của lượt đang chạy; lock của tiến trình
+  đã chết được tự thu hồi. Không giành được lock vì lý do khác cũng `exit 10` — runner
+  không bao giờ chạy khi thiếu lock.
+- Nếu không đóng được TUI cũ đã quản lý, runner dừng với `exit 10` thay vì mở thêm
+  TUI. Khi timeout mà `taskkill` không giết được Codex, lock được chuyển sang PID
+  Codex còn sống; các lượt sau vẫn bị chặn đến khi tiến trình đó tự kết thúc hoặc được
+  người dùng đóng thủ công.
 - `-Exec` hoặc `-NoTui` chạy headless, không mở cửa sổ nào.
+  Nếu đã có thread, runner in `TUI: codex resume <thread-id>` để mở lại đúng phiên;
+  lượt tạo thread mới sẽ in lệnh này ngay khi Codex trả về thread ID.
 - TUI cần thư mục repo nằm trong danh sách tin cậy của Codex (`~/.codex/config.toml`, mục
   `[projects.'...']` với `trust_level = "trusted"`). Thư mục lạ thì TUI chặn lại hỏi xác
   nhận, runner chỉ biết chờ tới timeout. Cách mồi: chạy một lượt `-NoTui` nhỏ trong repo
@@ -138,12 +155,17 @@ Cấm dùng `gpt-5.6-sol` và `gpt-6-astra` để implement code; runner Codex c
 | 7 | CLI hỏng cứng, không phải model từ chối task |
 | 8 | có thay đổi nhưng `test_command` fail |
 | 9 | phiên opencode thuộc repo khác — chặn để khỏi sửa nhầm dự án (chỉ lane OpenCode) |
-| 124 | quá `timeout_sec`. Lane Codex: `codex-run.ps1` giết cả cây tiến trình rồi thoát 124. Lane OpenCode: in `TIMEOUT` và báo `exit=124` trong tóm tắt, còn mã thoát cuối theo kết quả (5/0/8). |
+| 10 | không giành được run lock: runner Codex khác đang chạy, hoặc lock hỏng/không truy cập được — runner từ chối chạy, không đóng TUI của lượt kia (chỉ lane Codex) |
+| 11 | thiếu danh tính phiên Claude: không có `-Key` và cả hai env `CLAUDE_CODE_*` đều trống — coder không chạy (chỉ lane Codex) |
+| 124 | quá `timeout_sec`. Lane Codex: `codex-run.ps1` thử giết cả cây tiến trình; nếu không giết được thì giữ run lock theo PID còn sống rồi thoát 124. Lane OpenCode: in `TIMEOUT` và báo `exit=124` trong tóm tắt, còn mã thoát cuối theo kết quả (5/0/8). |
 
 ## Lưu ý
 
 - Lane OpenCode tự tìm server riêng của từng repo trong dải cổng `4096-4105`, nên chạy
   nhiều repo song song thì mỗi repo chiếm một cổng trong dải đó.
+- Mỗi lượt OpenCode đều in `TUI: opencode attach <URL> -s <session-id>`. Kể cả khi dùng
+  `-NoTui`, runner vẫn lấy/ghi session nhưng không mở CMD, để có thể dán lệnh này mở lại
+  đúng TUI sau khi chạy headless hoặc lỡ đóng cửa sổ.
 - Nếu runner in `BLOCKED: phien opencode dang o '<duong dan>'` thì phiên opencode đang
   thuộc repo khác — dùng `-NoTui`, hoặc đóng server đang chiếm cổng, rồi chạy lại. Lỗi
   này từng làm coder sửa nhầm sang một dự án khác nên chốt chặn cố ý `exit 9` (chặn hẳn

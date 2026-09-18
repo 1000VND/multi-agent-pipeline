@@ -17,7 +17,8 @@ param(
   [string]$Title = "",
   [string]$Key   = "",   # ghi de khoa phien Claude (chu yeu de test)
   [switch]$Fresh,        # ep tao phien opencode moi cho phien Claude nay
-  [switch]$CloseOnly     # chi dong cua so dang mo
+  [switch]$CloseOnly,    # chi dong cua so dang mo
+  [switch]$NoWindow      # chi lay/tao session, khong dong/mo CMD TUI
 )
 
 $ErrorActionPreference = "Stop"
@@ -77,15 +78,19 @@ if (-not $Key)   { $Key = "no-claude-session" }
 Write-Output "  phien Claude: $Key"
 
 # ---------- 1. dong cua so dang mo ----------
-$win = Read-Json $winFile
-if ($win -and $win.pid) {
-  $proc = Get-Process -Id $win.pid -ErrorAction SilentlyContinue
-  # chi giet dung cmd.exe ta da spawn; Windows tai su dung PID nen phai kiem
-  if ($proc -and $proc.ProcessName -eq "cmd") {
-    & taskkill /PID $win.pid /T /F 2>&1 | Out-Null
-    Write-Output "  dong cua so cu (PID $($win.pid))"
+# Headless van can session/URL de nguoi dung co the attach lai sau nay, nhung
+# khong duoc dong TUI ma ho dang xem.
+if (-not $NoWindow) {
+  $win = Read-Json $winFile
+  if ($win -and $win.pid) {
+    $proc = Get-Process -Id $win.pid -ErrorAction SilentlyContinue
+    # chi giet dung cmd.exe ta da spawn; Windows tai su dung PID nen phai kiem
+    if ($proc -and $proc.ProcessName -eq "cmd") {
+      & taskkill /PID $win.pid /T /F 2>&1 | Out-Null
+      Write-Output "  dong cua so cu (PID $($win.pid))"
+    }
+    Remove-Item $winFile -Force -ErrorAction SilentlyContinue
   }
-  Remove-Item $winFile -Force -ErrorAction SilentlyContinue
 }
 if ($CloseOnly) { Write-Output "CloseOnly: xong."; exit 0 }
 
@@ -188,13 +193,17 @@ $table[$Key] = @{
 $table | ConvertTo-Json -Depth 5 | Set-Content -Path $mapFile -Encoding utf8
 
 # ---------- 4. mo cua so CMD moi ----------
-$proc = Start-Process -FilePath "cmd.exe" `
-          -ArgumentList @("/k", "title opencode $sid && opencode attach $Url -s $sid") `
-          -WorkingDirectory $repo -PassThru
+if (-not $NoWindow) {
+  $proc = Start-Process -FilePath "cmd.exe" `
+            -ArgumentList @("/k", "title opencode $sid && opencode attach $Url -s $sid") `
+            -WorkingDirectory $repo -PassThru
 
-@{ pid = $proc.Id; sid = $sid; key = $Key; started = (Get-Date).ToString("s") } |
-  ConvertTo-Json | Set-Content -Path $winFile -Encoding utf8
+  @{ pid = $proc.Id; sid = $sid; key = $Key; started = (Get-Date).ToString("s") } |
+    ConvertTo-Json | Set-Content -Path $winFile -Encoding utf8
 
-Write-Output "  mo cua so TUI (PID $($proc.Id))"
+  Write-Output "  mo cua so TUI (PID $($proc.Id))"
+} else {
+  Write-Output "  khong mo cua so TUI (-NoWindow)"
+}
 Write-Output "URL=$Url"
 Write-Output "SESSION=$sid"
