@@ -110,7 +110,7 @@ Nếu worktree bẩn: **dừng, hỏi user**. Không tự `git stash`, không t�
 
 #### Chọn OpenCode
 
-- **Lưu ý truyền brief:** brief đi tới opencode qua dòng lệnh Windows PowerShell 5.1; `oc-run.ps1` đã tự escape dấu nháy kép và đọc brief bằng UTF-8 (sửa ở RM3), nên brief viết tiếng Việt và có dấu nháy là an toàn. Nếu thấy opencode in help rồi thoát với exit 5 mà không đụng file nào thì đó là dấu hiệu bug truyền tham số quay lại, không phải model từ chối task.
+- **Lưu ý truyền brief:** `oc-run.ps1` pipe toàn bộ brief UTF-8 vào standard input của `opencode`, không đưa brief vào dòng lệnh. Vì vậy brief dài hơn giới hạn 8,191 ký tự của `cmd.exe`, tiếng Việt, và dấu nháy đều an toàn. Nếu thấy opencode in help rồi thoát với exit 5 mà không đụng file nào thì đó là dấu hiệu bug truyền tham số quay lại, không phải model từ chối task.
 
 **TUI bật mặc định** khi giao việc; chỉ thêm `-NoTui` khi muốn tắt cửa sổ. Cờ `-NewTui` cũ vẫn được chấp nhận để lệnh cũ không gãy, nhưng không còn tác dụng riêng:
 

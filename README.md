@@ -166,6 +166,9 @@ Cấm dùng `gpt-5.6-sol` và `gpt-6-astra` để implement code; runner Codex c
 - Mỗi lượt OpenCode đều in `TUI: opencode attach <URL> -s <session-id>`. Kể cả khi dùng
   `-NoTui`, runner vẫn lấy/ghi session nhưng không mở CMD, để có thể dán lệnh này mở lại
   đúng TUI sau khi chạy headless hoặc lỡ đóng cửa sổ.
+- Nội dung task brief được pipe vào standard input UTF-8, không nằm trong command line. Vì
+  vậy brief dài hơn giới hạn 8,191 ký tự của `cmd.exe`, có tiếng Việt hoặc dấu nháy vẫn chạy
+  được.
 - Nếu runner in `BLOCKED: phien opencode dang o '<duong dan>'` thì phiên opencode đang
   thuộc repo khác — dùng `-NoTui`, hoặc đóng server đang chiếm cổng, rồi chạy lại. Lỗi
   này từng làm coder sửa nhầm sang một dự án khác nên chốt chặn cố ý `exit 9` (chặn hẳn

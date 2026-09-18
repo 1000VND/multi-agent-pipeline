@@ -20,7 +20,8 @@ param(
   [switch]$NewTui,        # co cu: TUI gio bat mac dinh, tham so nay khong con tac dung rieng
   [switch]$FreshTui,      # kem -NewTui: ep tao phien opencode moi thay vi dung lai phien cu
   [switch]$NoTui,         # tat han cua so TUI (mac dinh la bat)
-  [int]$TimeoutSec = 0
+  [int]$TimeoutSec = 0,
+  [string]$OpenCodeCmd = "" # test/diagnostic: duong dan day du toi opencode.cmd
 )
 
 $ErrorActionPreference = "Stop"
@@ -54,6 +55,7 @@ $testCommand = ""
 if ($pipelineConfig) { $testCommand = [string]$pipelineConfig.test_command }
 
 if (-not (Test-Path $TaskFile)) { Write-Output "Khong thay task file: $TaskFile"; exit 2 }
+$taskFilePath = (Resolve-Path -LiteralPath $TaskFile).Path
 
 # Bat buoc worktree sach truoc khi giao viec -> git diff sau do = dung
 # phan opencode vua lam, khong lan voi thay doi cu.
@@ -118,7 +120,7 @@ if ($Attach -ne "") { $tuiArgs += @("-Url", $Attach) }
 $tuiArgs += @("-Title", "Task $([IO.Path]::GetFileNameWithoutExtension($TaskFile))")
 if ($FreshTui) { $tuiArgs += "-Fresh" }
 if ($NoTui) { $tuiArgs += "-NoWindow" }
-$tui = & powershell -NoProfile -File (Join-Path $PSScriptRoot "oc-tui.ps1") @tuiArgs
+$tui = & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $PSScriptRoot "oc-tui.ps1") @tuiArgs
 $tui | ForEach-Object { Write-Output $_ }
 $line = $tui | Where-Object { $_ -match "^SESSION=" } | Select-Object -Last 1
 if (-not $line) { Write-Error "oc-tui.ps1 khong tra ve session id."; exit 6 }
@@ -139,22 +141,32 @@ $logDir = Join-Path $repo ".pipeline\logs"
 if (-not (Test-Path $logDir)) { New-Item -ItemType Directory -Path $logDir | Out-Null }
 
 $head   = & git rev-parse HEAD
-$prompt    = Get-Content -Raw -Encoding UTF8 -Path $TaskFile
-# PowerShell 5.1 khong tu escape dau nhay kep khi goi native exe: prompt co dau "
-# se bi tach thanh nhieu argv va opencode in help roi thoat. Nhan doi backslash
-# dung truoc roi escape dau nhay theo quy uoc dong lenh Windows.
-$promptArg = $prompt -replace '(\\*)"', '$1$1\"'
 
 # npm cai ca opencode.ps1 va opencode.cmd. Tren mot so ban Windows/Bun,
 # shim .ps1 co the loi EEXIST luc khoi dong trong khi shim .cmd van chay
 # binh thuong. Ep dung .cmd de runner khop voi lenh opencode trong CMD.
-$openCodeCmd = Get-Command "opencode.cmd" -CommandType Application -ErrorAction SilentlyContinue |
-  Select-Object -First 1
-if (-not $openCodeCmd) {
-  Write-Output "LOI: khong tim thay opencode.cmd trong PATH. Mo CMD, chay 'opencode --version', roi cai/sua PATH cua OpenCode."
-  exit 7
+$openCodePath = ""
+if ($OpenCodeCmd -ne "") {
+  try {
+    $openCodePath = (Resolve-Path -LiteralPath $OpenCodeCmd -ErrorAction Stop).Path
+  } catch {
+    Write-Output "LOI: khong tim thay opencode.cmd da chi dinh: $OpenCodeCmd"
+    exit 7
+  }
+  if ([IO.Path]::GetFileName($openCodePath) -ine "opencode.cmd") {
+    Write-Output "LOI: -OpenCodeCmd phai tro toi file opencode.cmd, khong phai '$openCodePath'."
+    exit 7
+  }
+} else {
+  $openCodeCmdInfo = Get-Command "opencode.cmd" -CommandType Application -ErrorAction SilentlyContinue |
+    Select-Object -First 1
+  if (-not $openCodeCmdInfo) {
+    Write-Output "LOI: khong tim thay opencode.cmd trong PATH. Mo CMD, chay 'opencode --version', roi cai/sua PATH cua OpenCode."
+    exit 7
+  }
+  $openCodePath = $openCodeCmdInfo.Source
 }
-$openCodePath = $openCodeCmd.Source
+Write-Output "CLI: $openCodePath"
 
 # opencode in usage/help khi prompt khong toi noi nguyen ven -> nhan dien de khong dot fallback.
 function Test-ArgError($logPath) {
@@ -169,24 +181,35 @@ function Invoke-OpenCode($modelId, $variantName, $logPath) {
   if ($Attach  -ne "")     { $ocArgs += @("--attach", $Attach) }
   if ($Session -ne "")     { $ocArgs += @("--session", $Session) }
   if ($Resume)             { $ocArgs += "--continue" }
-  $ocArgs += $promptArg
 
   $label = if ($variantName -ne "") { "$modelId (variant $variantName)" } else { $modelId }
-  Write-Output "=> opencode $label | task=$base | log=$logPath"
+  Write-Output "=> opencode $label | task=$base (stdin UTF-8) | log=$logPath"
   if ($Attach -ne "") { Write-Output "   xem live: $tuiHint" }
 
   $sw = [Diagnostics.Stopwatch]::StartNew()
   # Job tu ghi PID cua no ra file trong TEMP de cha biet duong giet ca cay khi
-  # het gio; khong doi cach truyen prompt (van splatting qua job).
+  # het gio. Brief truyen qua stdin, khong nam trong argv: tranh gioi han 8191
+  # ky tu cua opencode.cmd/cmd.exe va khong can tu escape dau nhay.
   $pidFile = Join-Path $env:TEMP ("oc-run-{0}-{1}.pid" -f $Tag, [guid]::NewGuid().ToString("N").Substring(0, 8))
   # stdout+stderr -> file. Timeout bang job de khong treo session.
   $job = Start-Job -ScriptBlock {
-    param($a, $l, $cwd, $pf, $exe)
+    param($a, $l, $cwd, $pf, $exe, $task)
     Set-Content -Path $pf -Value $PID
     Set-Location $cwd
-    & $exe @a *>&1 | Out-File -FilePath $l -Encoding utf8
-    $LASTEXITCODE
-  } -ArgumentList $ocArgs, $logPath, $repo, $pidFile, $openCodePath
+    # Windows PowerShell 5.1 mac dinh ghi ASCII vao native stdin; ep UTF-8
+    # de brief tieng Viet va ky tu dac biet den OpenCode nguyen ven.
+    $previousOutputEncoding = $OutputEncoding
+    $OutputEncoding = New-Object System.Text.UTF8Encoding($false)
+    try {
+      Get-Content -Raw -Encoding UTF8 -LiteralPath $task |
+        & $exe @a *>&1 |
+        Out-File -FilePath $l -Encoding utf8
+      $exitCode = $LASTEXITCODE
+    } finally {
+      $OutputEncoding = $previousOutputEncoding
+    }
+    $exitCode
+  } -ArgumentList $ocArgs, $logPath, $repo, $pidFile, $openCodePath, $taskFilePath
 
   if (-not (Wait-Job $job -Timeout $TimeoutSec)) {
     # Stop-Job chi giet job PowerShell, opencode.exe ma job de ra van song tiep.
