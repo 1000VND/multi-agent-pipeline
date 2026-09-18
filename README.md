@@ -28,9 +28,10 @@ cd multi-agent-pipeline
 ```
 
 `<repo-dich>` phải là git repo (chạy `git init` trước nếu chưa). Install chạy lại được
-nhiều lần: lần sau chỉ cập nhật phần code, giữ nguyên `pipeline.config.json` và
-`state.json`. Thêm `-Force` nếu muốn đè cả file dữ liệu — khi đó install in rõ từng file
-bị đè.
+nhiều lần: lần sau cập nhật phần code, giữ nguyên `state.json` và các field riêng của
+`pipeline.config.json`. Riêng schema fallback OpenCode trong config được tự migrate để
+nhận policy model mới. Thêm `-Force` nếu muốn đè cả file dữ liệu — khi đó install in rõ
+từng file bị đè.
 
 ### -NoGitTrack
 
@@ -194,5 +195,6 @@ git pull
 ```
 
 Phần code trong `.pipeline/bin`, `.claude/agents`, `.claude/skills/pipeline` được copy đè;
-`pipeline.config.json`, `state.json`, `PROJECT_RULES.md`, `tasks/_TEMPLATE.md` và
-`.pipeline/.gitignore` giữ nguyên trừ khi chạy `-Force`.
+`state.json`, `PROJECT_RULES.md`, `tasks/_TEMPLATE.md` và `.pipeline/.gitignore` giữ
+nguyên trừ khi chạy `-Force`. `pipeline.config.json` giữ các field riêng của project, nhưng
+tự migrate hai chuỗi fallback OpenCode để nhận model policy mới.
