@@ -25,6 +25,7 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
+$fallbackOverrideRequested = $PSBoundParameters.ContainsKey("Fallback")
 $repo = (& git rev-parse --show-toplevel 2>$null)
 if (-not $repo) { Write-Output "Khong phai git repo. Pipeline nay bat buoc dung git."; exit 2 }
 
@@ -47,8 +48,54 @@ if (($Model -eq "") -and $cfgOpenCode.primary) { $Model = [string]$cfgOpenCode.p
 if ($Model -eq "") { $Model = "opencode-go/deepseek-v4.1-flash" }
 if (($Variant -eq "") -and $cfgOpenCode.variant) { $Variant = [string]$cfgOpenCode.variant }
 if ($Variant -eq "") { $Variant = "max" }
-if (($Fallback -eq "") -and $cfgOpenCode.fallback) { $Fallback = [string]$cfgOpenCode.fallback }
-if ($Fallback -eq "") { $Fallback = "opencode-go/mimo-v2.5-pro" }
+
+# Chuoi fallback co variant rieng: khong duoc ep --variant max vao model khong
+# ho tro (MiMo), va LongCat/Qwen co muc cao nhat khac nhau. Config cu chi co
+# "fallback" duoc thay the bang hai danh sach co thu tu ro rang ben duoi.
+$builtInNoChangeFallbacks = @(
+  [pscustomobject]@{ model = "opencode-go/deepseek-v4-flash";            variant = "max" },
+  [pscustomobject]@{ model = "opencode-go/deepseek-v4-flash-vision-exp"; variant = "max" },
+  [pscustomobject]@{ model = "opencode-go/mimo-v2.5-pro";                variant = "" },
+  [pscustomobject]@{ model = "opencode-go/longcat-2.0";                  variant = "high" },
+  [pscustomobject]@{ model = "opencode-go/qwen3.8-flash";               variant = "xhigh" }
+)
+$builtInQuotaFallbacks = @(
+  $builtInNoChangeFallbacks[4],
+  $builtInNoChangeFallbacks[3],
+  $builtInNoChangeFallbacks[2],
+  $builtInNoChangeFallbacks[1],
+  $builtInNoChangeFallbacks[0]
+)
+
+function Get-ModelSequence($configured, $defaultSequence) {
+  $items = @()
+  foreach ($entry in @($configured)) {
+    if ($null -eq $entry) { continue }
+    $modelName = ""
+    $variantName = ""
+    if ($entry -is [string]) {
+      $modelName = [string]$entry
+    } else {
+      $modelName = [string]$entry.model
+      $variantName = [string]$entry.variant
+    }
+    if ($modelName -ne "") {
+      $items += [pscustomobject]@{ model = $modelName; variant = $variantName }
+    }
+  }
+  if ($items.Count -eq 0) { return @($defaultSequence) }
+  return @($items)
+}
+
+$noChangeFallbacks = Get-ModelSequence $cfgOpenCode.fallback_on_no_change $builtInNoChangeFallbacks
+$quotaFallbacks    = Get-ModelSequence $cfgOpenCode.fallback_on_quota     $builtInQuotaFallbacks
+# -Fallback/-FallbackVariant la override tuong thich nguoc: mot model thay ca
+# hai chuoi fallback cua lanh hien tai, uu tien cao hon config.
+if ($fallbackOverrideRequested) {
+  $override = [pscustomobject]@{ model = $Fallback; variant = $FallbackVariant }
+  $noChangeFallbacks = @($override)
+  $quotaFallbacks = @($override)
+}
 if (($TimeoutSec -le 0) -and $pipelineConfig.timeout_sec) { $TimeoutSec = [int]$pipelineConfig.timeout_sec }
 if ($TimeoutSec -le 0) { $TimeoutSec = 1200 }
 $testCommand = ""
@@ -175,6 +222,14 @@ function Test-ArgError($logPath) {
   return [bool]($head -match 'opencode run \[message')
 }
 
+# Chi dung chuoi quota khi CLI/API bao het quota, rate limit hoac model khong
+# kha dung. Khong coi loi prompt/CLI la quota de tranh thu model khac vo ich.
+function Test-QuotaOrUnavailable($logPath) {
+  if (-not (Test-Path $logPath)) { return $false }
+  $text = Get-Content -Raw -Encoding UTF8 -Path $logPath -ErrorAction SilentlyContinue
+  return [bool]($text -match '(?im)(\bquota\b|rate[ -]?limit|usage[ -]?limit|too many requests|insufficient (credit|balance)|model .*\b(unavailable|not available)\b)')
+}
+
 function Invoke-OpenCode($modelId, $variantName, $logPath) {
   $ocArgs = @("run", "--auto", "--model", $modelId)
   if ($variantName -ne "") { $ocArgs += @("--variant", $variantName) }
@@ -261,21 +316,29 @@ function Invoke-OpenCode($modelId, $variantName, $logPath) {
 if ($Attach -ne "") { Assert-SessionRepo $Attach $Session }
 $log = Join-Path $logDir "$base-$Tag.log"
 $r   = Invoke-OpenCode $Model $Variant $log
-$usedModel = $Model
+$usedModels = @("$Model" + $(if ($Variant -ne "") { " ($Variant)" } else { "" }))
 $changed   = & git status --porcelain
 
 # ---------- fallback ----------
-# Chi fallback khi luot dau KHONG dong vao file nao. Neu no da sua do dang
-# roi hong, de nguyen cho Claude xem xet - khong tha model thu hai vao
-# dam len thay doi cua model thu nhat. Timeout la chung cuoc: input khong
-# doi thi model thu hai cung chi het gio.
-if ((-not $changed) -and (-not $r.timedout) -and (-not $NoFallback) -and ($Fallback -ne "") -and (-not (Test-ArgError $log))) {
-  Write-Output ""
-  Write-Output "--- luot dau khong sinh thay doi (exit=$($r.code)) -> thu fallback ---"
-  $log = Join-Path $logDir "$base-$Tag-fallback.log"
-  $r   = Invoke-OpenCode $Fallback $FallbackVariant $log
-  $usedModel = $Fallback
-  $changed   = & git status --porcelain
+# Chi fallback khi luot truoc KHONG dong vao file nao. Neu da sua do dang thi
+# giu nguyen de review; timeout/loi tham so cung khong dem sang model tiep.
+$canFallback = (-not $changed) -and (-not $r.timedout) -and (-not $NoFallback) -and (-not (Test-ArgError $log))
+if ($canFallback) {
+  $quotaPath = Test-QuotaOrUnavailable $log
+  $fallbackSequence = if ($quotaPath) { $quotaFallbacks } else { $noChangeFallbacks }
+  $reason = if ($quotaPath) { "DeepSeek het quota/khong kha dung" } else { "luot truoc khong sinh thay doi" }
+  $attempt = 0
+  foreach ($candidate in $fallbackSequence) {
+    if ($candidate.model -eq "") { continue }
+    $attempt++
+    Write-Output ""
+    Write-Output "--- $reason -> fallback $attempt/$($fallbackSequence.Count): $($candidate.model) ---"
+    $log = Join-Path $logDir "$base-$Tag-fallback-$attempt.log"
+    $r = Invoke-OpenCode $candidate.model $candidate.variant $log
+    $usedModels += "$($candidate.model)" + $(if ($candidate.variant -ne "") { " ($($candidate.variant))" } else { "" })
+    $changed = & git status --porcelain
+    if ($changed -or $r.timedout -or (Test-ArgError $log)) { break }
+  }
 }
 
 $stat = & git diff --stat
@@ -309,7 +372,7 @@ if ($changed) {
 
 Write-Output ""
 Write-Output "--- KET QUA ($($r.secs)s, exit=$($r.code)) ---"
-Write-Output "MODEL DA DUNG: $usedModel"
+Write-Output "MODELS DA THU: $($usedModels -join ' -> ')"
 Write-Output "BASE_COMMIT: $head"
 Write-Output "FILES THAY DOI:"
 if ($changed) { Write-Output $changed } else { Write-Output "  (KHONG CO FILE NAO THAY DOI - coi nhu task that bai)" }

@@ -9,7 +9,20 @@
     "opencode": {
       "primary": "opencode-go/deepseek-v4.1-flash",
       "variant": "max",
-      "fallback": "opencode-go/mimo-v2.5-pro"
+      "fallback_on_no_change": [
+        { "model": "opencode-go/deepseek-v4-flash", "variant": "max" },
+        { "model": "opencode-go/deepseek-v4-flash-vision-exp", "variant": "max" },
+        { "model": "opencode-go/mimo-v2.5-pro", "variant": "" },
+        { "model": "opencode-go/longcat-2.0", "variant": "high" },
+        { "model": "opencode-go/qwen3.8-flash", "variant": "xhigh" }
+      ],
+      "fallback_on_quota": [
+        { "model": "opencode-go/qwen3.8-flash", "variant": "xhigh" },
+        { "model": "opencode-go/longcat-2.0", "variant": "high" },
+        { "model": "opencode-go/mimo-v2.5-pro", "variant": "" },
+        { "model": "opencode-go/deepseek-v4-flash-vision-exp", "variant": "max" },
+        { "model": "opencode-go/deepseek-v4-flash", "variant": "max" }
+      ]
     },
     "codex": {
       "default": { "model": "gpt-5.6-luna", "reasoning_effort": "xhigh" },

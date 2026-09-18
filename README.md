@@ -105,11 +105,23 @@ chạy tiếp bằng mặc định built-in, không fail.
 
 | Lane | Mặc định | Leo thang |
 |---|---|---|
-| OpenCode | `opencode-go/deepseek-v4.1-flash` + `--variant max`, fallback `opencode-go/mimo-v2.5-pro` | (không đổi) |
+| OpenCode | `opencode-go/deepseek-v4.1-flash` + `--variant max` | fallback theo chuỗi bên dưới |
 | Codex | `gpt-5.6-luna` + `model_reasoning_effort=xhigh` | `gpt-5.6-terra` + `model_reasoning_effort=high` |
 
 Cấm dùng `gpt-5.6-sol` và `gpt-6-astra` để implement code; runner Codex chặn cứng bằng
 `exit 2`. Thang leo bậc và luật worktree sạch nằm trong `SKILL.md`.
+
+### Fallback OpenCode
+
+Nếu lượt trước không tạo thay đổi file, runner lần lượt thử: **DeepSeek V4 Flash**
+(`max`) → **DeepSeek V4 Flash Vision Exp** (`max`) → **MiMo V2.5 Pro** (không có
+variant) → **LongCat-2.0** (`high`) → **Qwen3.8 Flash** (`xhigh`).
+
+Nếu primary DeepSeek V4.1 Flash báo hết quota/rate limit hoặc model không khả dụng, runner
+đổi thứ tự để ưu tiên phương án rẻ hơn trước: **Qwen3.8 Flash** (`xhigh`) →
+**LongCat-2.0** (`high`) → **MiMo V2.5 Pro** → **DeepSeek V4 Flash Vision Exp** (`max`)
+→ **DeepSeek V4 Flash** (`max`).
+Runner dừng chuỗi khi một model đã sửa file, timeout, hoặc lỗi tham số CLI.
 
 ## Lane Codex
 

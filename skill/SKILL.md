@@ -35,7 +35,7 @@ backend thì làm đúng; nếu không, Claude chọn trong lúc plan và trình
 
 | Coder | Runner Claude | Script | Model |
 |---|---|---|---|
-| OpenCode | `oc-coder` | `.pipeline/bin/oc-run.ps1` | `deepseek-v4.1-flash` (`max`), fallback `mimo-v2.5-pro` |
+| OpenCode | `oc-coder` | `.pipeline/bin/oc-run.ps1` | `deepseek-v4.1-flash` (`max`), fallback theo chuỗi policy |
 | Codex | `codex-coder` | `.pipeline/bin/codex-run.ps1` | `gpt-5.6-luna` + `xhigh`; leo thang `gpt-5.6-terra` + `high` |
 
 Để dùng backend Codex, máy chạy Claude phải có lệnh `codex` trong `PATH` và Codex
@@ -51,7 +51,7 @@ nguyên để review; không thả coder thứ hai vào đè lên thay đổi. M
 
 | Lane | Mặc định | Leo thang |
 |---|---|---|
-| OpenCode | `opencode-go/deepseek-v4.1-flash` + `--variant max`, fallback `opencode-go/mimo-v2.5-pro` | (không đổi, giữ nguyên hành vi hiện có) |
+| OpenCode | `opencode-go/deepseek-v4.1-flash` + `--variant max` | chuỗi fallback theo policy bên dưới |
 | Codex | `gpt-5.6-luna` + `model_reasoning_effort=xhigh` | `gpt-5.6-terra` + `model_reasoning_effort=high` |
 
 **Cấm dùng để implement code:** `gpt-5.6-sol` và `gpt-6-astra`, kể cả khi task khó; muốn
@@ -71,6 +71,13 @@ Khi leo bậc bắt buộc chạy **thread mới với `-FreshSession`**, và wo
 trước; thả model mới đè lên thì không biết ai làm phần nào.
 
 Chính sách nằm trong `model_policy` của `.pipeline/pipeline.config.json`.
+
+**Fallback OpenCode:** nếu lượt không sửa file, thử theo thứ tự DeepSeek V4 Flash (`max`)
+→ Vision Exp (`max`) → MiMo V2.5 Pro (không truyền variant) → LongCat-2.0 (`high`) →
+Qwen3.8 Flash (`xhigh`). Nếu primary DeepSeek V4.1 Flash báo quota/rate limit/model
+unavailable, dùng chuỗi ngược: Qwen → LongCat → MiMo → Vision Exp → DeepSeek V4 Flash.
+Dừng khi có thay đổi file, timeout hoặc lỗi tham số; không thả model khác đè lên worktree
+đã có sửa dở.
 
 ## Giai đoạn 1 — Plan
 
