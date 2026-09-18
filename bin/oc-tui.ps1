@@ -30,9 +30,23 @@ $winFile  = Join-Path $stateDir "tui.json"      # cua so dang mo
 $mapFile  = Join-Path $stateDir "tui-map.json"  # phien Claude -> phien opencode
 if (-not (Test-Path $stateDir)) { New-Item -ItemType Directory -Path $stateDir | Out-Null }
 
+$contextRolloverPercent = 80
+try {
+  $configPath = Join-Path $stateDir "pipeline.config.json"
+  if (Test-Path $configPath) {
+    $config = Get-Content -Raw -Encoding UTF8 $configPath | ConvertFrom-Json
+    if ($config.session_rollover.context_percent) { $contextRolloverPercent = [int]$config.session_rollover.context_percent }
+  }
+} catch { }
+if ($contextRolloverPercent -lt 1 -or $contextRolloverPercent -gt 99) { $contextRolloverPercent = 80 }
+
 function Read-Json($path) {
   if (-not (Test-Path $path)) { return $null }
   try { return (Get-Content -Raw $path | ConvertFrom-Json) } catch { return $null }
+}
+function Set-ObjectProperty($object, $name, $value) {
+  $prop = $object.PSObject.Properties[$name]
+  if ($prop) { $prop.Value = $value } else { $object | Add-Member -NotePropertyName $name -NotePropertyValue $value }
 }
 function Test-Server {
   try { Invoke-RestMethod -Uri "$Url/session" -TimeoutSec 4 -ErrorAction Stop | Out-Null; return $true }
@@ -69,6 +83,109 @@ function Get-Worktree($baseUrl) {
   }
   if ($proj -and $proj.worktree) { return [string]$proj.worktree }
   return ""
+}
+
+# OpenCode ghi usage theo từng message va cong lifetime theo session. Chi dung
+# message gan nhat (context thuc te cua request), TUYET DOI khong dung tong
+# lifetime vi cache.read se lam no phinh ra du context window.
+function Get-Number($object, $names) {
+  if (-not $object) { return 0L }
+  foreach ($name in $names) {
+    $prop = $object.PSObject.Properties[$name]
+    if ($prop -and $null -ne $prop.Value) {
+      try { return [int64]$prop.Value } catch { }
+    }
+  }
+  return 0L
+}
+function Get-ModelContextLimit($node, $wantedIds, $nodeName = "", $depth = 0) {
+  if (-not $node -or $depth -gt 6) { return 0L }
+  if ($node -is [System.Collections.IEnumerable] -and -not ($node -is [string])) {
+    foreach ($child in $node) {
+      $hit = Get-ModelContextLimit $child $wantedIds "" ($depth + 1)
+      if ($hit -gt 0) { return $hit }
+    }
+    return 0L
+  }
+  if (-not $node.PSObject) { return 0L }
+  $ids = @($nodeName)
+  foreach ($field in @("id", "modelID", "model_id")) {
+    $prop = $node.PSObject.Properties[$field]
+    if ($prop -and $prop.Value) { $ids += [string]$prop.Value }
+  }
+  $matches = $false
+  foreach ($id in $ids) {
+    if ($wantedIds -contains $id) { $matches = $true; break }
+  }
+  if ($matches) {
+    $limit = Get-Number $node @("context_window", "contextWindow", "context")
+    if ($limit -le 0 -and $node.limit) { $limit = Get-Number $node.limit @("context", "context_window") }
+    if ($limit -gt 0) { return $limit }
+  }
+  foreach ($prop in $node.PSObject.Properties) {
+    if ($prop.Value -is [string] -or $prop.Value -is [ValueType]) { continue }
+    $hit = Get-ModelContextLimit $prop.Value $wantedIds $prop.Name ($depth + 1)
+    if ($hit -gt 0) { return $hit }
+  }
+  return 0L
+}
+function Get-OpenCodeSessionContext($sid) {
+  try {
+    $response = Invoke-RestMethod -Uri "$Url/session/$sid/message?limit=100" -TimeoutSec 8 -ErrorAction Stop
+    $messages = if ($response.data) { @($response.data) } elseif ($response.items) { @($response.items) } else { @($response) }
+    $message = @($messages | Where-Object { $_.info -and $_.info.tokens } | Select-Object -Last 1)
+    if ($message.Count -eq 0) { return $null }
+    $tokens = $message[0].info.tokens
+    $cache = $tokens.cache
+    $used = (Get-Number $tokens @("input", "input_tokens")) +
+      (Get-Number $cache @("read", "cached_input_tokens")) +
+      (Get-Number $cache @("write", "cache_write_input_tokens")) +
+      (Get-Number $tokens @("output", "output_tokens")) +
+      (Get-Number $tokens @("reasoning", "reasoning_output_tokens"))
+    $modelId = [string]$message[0].info.modelID
+    if (-not $modelId) { $modelId = [string]$message[0].info.model_id }
+    $providerId = [string]$message[0].info.providerID
+    if (-not $providerId) { $providerId = [string]$message[0].info.provider_id }
+    $wantedIds = @($modelId)
+    if ($providerId -and $modelId) { $wantedIds += "$providerId/$modelId" }
+    try { $providers = Invoke-RestMethod -Uri "$Url/provider" -TimeoutSec 8 -ErrorAction Stop } catch { $providers = $null }
+    $window = Get-ModelContextLimit $providers $wantedIds
+    if ($used -le 0 -or $window -le 0) { return $null }
+    return @{ used_tokens = [int64]$used; context_window = [int64]$window; percent = [math]::Round((100.0 * $used / $window), 1) }
+  } catch { return $null }
+}
+function Get-OpenCodeSessionHistory($existing) {
+  $history = [System.Collections.Generic.List[object]]::new()
+  if ($existing) {
+    foreach ($entry in @($existing.opencode_sessions)) {
+      if ($entry -and $entry.session_id) { $history.Add($entry) }
+    }
+    if ($existing.opencode_session -and -not (@($history | Where-Object { $_.session_id -eq $existing.opencode_session }).Count)) {
+      $history.Add([pscustomobject]@{
+        session_id = [string]$existing.opencode_session
+        created_at = if ($existing.last_used) { [string]$existing.last_used } else { (Get-Date).ToString("s") }
+        last_used = if ($existing.last_used) { [string]$existing.last_used } else { (Get-Date).ToString("s") }
+      })
+    }
+  }
+  return ,$history
+}
+function Retire-OpenCodeSession($table, $key, $sid, $context) {
+  if (-not $table.ContainsKey($key)) { return }
+  $record = $table[$key]
+  $history = Get-OpenCodeSessionHistory $record
+  $entry = @($history | Where-Object { $_.session_id -eq $sid } | Select-Object -First 1)
+  if ($entry.Count -eq 0) {
+    $entry = @([pscustomobject]@{ session_id = $sid; created_at = (Get-Date).ToString("s") })
+    $history.Add($entry[0])
+  }
+  Set-ObjectProperty $entry[0] "last_used" (Get-Date).ToString("s")
+  Set-ObjectProperty $entry[0] "retired_at" (Get-Date).ToString("s")
+  Set-ObjectProperty $entry[0] "retired_reason" "context_over_$contextRolloverPercent%"
+  Set-ObjectProperty $entry[0] "last_context_tokens" ([int64]$context.used_tokens)
+  Set-ObjectProperty $entry[0] "context_window_tokens" ([int64]$context.context_window)
+  Set-ObjectProperty $record "opencode_sessions" $history
+  $table[$key] = $record
 }
 
 # ---------- khoa phien Claude ----------
@@ -163,12 +280,21 @@ if (-not $Fresh -and $table.ContainsKey($Key)) {
   $check = $null
   if ($candidate) { $check = Test-Session $candidate }
   if ($candidate -and $check.ok) {
-    $sid = $candidate
-    Write-Output "  DUNG LAI phien opencode cu: $sid"
-  } elseif ($candidate -and $check.exists) {
-    Write-Output "  phien cu ($candidate) thuoc repo '$($check.directory)', khong dung duoc o day - se tao phien moi"
-  } else {
-    Write-Output "  phien cu ($candidate) khong con tren server, se tao moi"
+    $context = Get-OpenCodeSessionContext $candidate
+    if ($context -and $context.percent -ge $contextRolloverPercent) {
+      Write-Output "CONTEXT: phien opencode $candidate dang $($context.percent)% ($($context.used_tokens)/$($context.context_window) tokens) - tao phien moi"
+      Retire-OpenCodeSession $table $Key $candidate $context
+    } else {
+      $sid = $candidate
+      Write-Output "  DUNG LAI phien opencode cu: $sid"
+    }
+  }
+  if (-not $sid -and $candidate -and -not $check.ok) {
+    if ($check.exists) {
+      Write-Output "  phien cu ($candidate) thuoc repo '$($check.directory)', khong dung duoc o day - se tao phien moi"
+    } else {
+      Write-Output "  phien cu ($candidate) khong con tren server, se tao moi"
+    }
   }
 }
 
@@ -185,12 +311,22 @@ if (-not $sid) {
   Write-Output "  TAO MOI phien opencode: $sid"
 }
 
+$previous = if ($table.ContainsKey($Key)) { $table[$Key] } else { $null }
+$history = Get-OpenCodeSessionHistory $previous
+$now = (Get-Date).ToString("s")
+$entry = @($history | Where-Object { $_.session_id -eq $sid } | Select-Object -First 1)
+if ($entry.Count -eq 0) {
+  $history.Add([pscustomobject]@{ session_id = $sid; created_at = $now; last_used = $now })
+} else {
+  Set-ObjectProperty $entry[0] "last_used" $now
+}
 $table[$Key] = @{
   opencode_session  = $sid
   claude_session_id = $env:CLAUDE_CODE_SESSION_ID
-  last_used         = (Get-Date).ToString("s")
+  last_used         = $now
+  opencode_sessions = $history
 }
-$table | ConvertTo-Json -Depth 5 | Set-Content -Path $mapFile -Encoding utf8
+$table | ConvertTo-Json -Depth 6 | Set-Content -Path $mapFile -Encoding utf8
 
 # ---------- 4. mo cua so CMD moi ----------
 if (-not $NoWindow) {

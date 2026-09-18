@@ -48,6 +48,12 @@ if (($TimeoutSec -le 0) -and $pipelineConfig.timeout_sec) { $TimeoutSec = [int]$
 if ($TimeoutSec -le 0) { $TimeoutSec = 1200 }
 $testCommand = ""
 if ($pipelineConfig) { $testCommand = [string]$pipelineConfig.test_command }
+$contextRolloverPercent = 80
+if ($pipelineConfig -and $pipelineConfig.session_rollover.context_percent) {
+  $contextRolloverPercent = [int]$pipelineConfig.session_rollover.context_percent
+}
+# Ngưỡng 100% không còn chỗ cho prompt kế tiếp; 1% cũng khiến mọi lượt bị tách.
+if ($contextRolloverPercent -lt 1 -or $contextRolloverPercent -gt 99) { $contextRolloverPercent = 80 }
 
 # Model bi cam dung de implement code (co the ghi de trong pipeline.config.json).
 $forbiddenModels = @("gpt-5.6-sol", "gpt-6-astra")
@@ -243,19 +249,72 @@ function Read-MapTable {
   return $table
 }
 
+function Set-ObjectProperty($object, $name, $value) {
+  $prop = $object.PSObject.Properties[$name]
+  if ($prop) { $prop.Value = $value } else { $object | Add-Member -NotePropertyName $name -NotePropertyValue $value }
+}
+
+function Get-CodexSessionHistory($existing) {
+  $history = [System.Collections.Generic.List[object]]::new()
+  if ($existing) {
+    foreach ($entry in @($existing.codex_sessions)) {
+      if ($entry -and $entry.thread_id) { $history.Add($entry) }
+    }
+    # Map đời cũ chỉ có codex_thread. Đưa nó vào lịch sử trước khi ghi đè.
+    if ($existing.codex_thread -and -not (@($history | Where-Object { $_.thread_id -eq $existing.codex_thread }).Count)) {
+      $history.Add([pscustomobject]@{
+        thread_id = [string]$existing.codex_thread
+        created_at = if ($existing.last_used) { [string]$existing.last_used } else { (Get-Date).ToString("s") }
+        last_used = if ($existing.last_used) { [string]$existing.last_used } else { (Get-Date).ToString("s") }
+      })
+    }
+  }
+  return ,$history
+}
+
 function Save-Session($threadId, $tuiPid = $null) {
   if (-not $threadId) { return }
   $table = Read-MapTable
+  $previous = if ($table.ContainsKey($mapKey)) { $table[$mapKey] } else { $null }
+  $history = Get-CodexSessionHistory $previous
+  $now = (Get-Date).ToString("s")
+  $entry = @($history | Where-Object { $_.thread_id -eq $threadId } | Select-Object -First 1)
+  if ($entry.Count -eq 0) {
+    $history.Add([pscustomobject]@{ thread_id = $threadId; created_at = $now; last_used = $now })
+  } else {
+    Set-ObjectProperty $entry[0] "last_used" $now
+  }
   $record = @{
     codex_thread = $threadId
     claude_session_id = $env:CLAUDE_CODE_SESSION_ID
     session_key = $Key
     last_task_id = $TaskId
-    last_used = (Get-Date).ToString("s")
+    last_used = $now
+    codex_sessions = $history
   }
   if ($tuiPid) { $record.tui_pid = [int]$tuiPid }
   $table[$mapKey] = $record
   $table | ConvertTo-Json -Depth 5 | Set-Content -Path $mapFile -Encoding UTF8
+}
+
+function Retire-CodexSession($threadId, $context) {
+  $table = Read-MapTable
+  if (-not $table.ContainsKey($mapKey)) { return }
+  $previous = $table[$mapKey]
+  $history = Get-CodexSessionHistory $previous
+  $entry = @($history | Where-Object { $_.thread_id -eq $threadId } | Select-Object -First 1)
+  if ($entry.Count -eq 0) {
+    $entry = @([pscustomobject]@{ thread_id = $threadId; created_at = (Get-Date).ToString("s") })
+    $history.Add($entry[0])
+  }
+  Set-ObjectProperty $entry[0] "last_used" (Get-Date).ToString("s")
+  Set-ObjectProperty $entry[0] "retired_at" (Get-Date).ToString("s")
+  Set-ObjectProperty $entry[0] "retired_reason" "context_over_$contextRolloverPercent%"
+  Set-ObjectProperty $entry[0] "last_context_tokens" ([int64]$context.used_tokens)
+  Set-ObjectProperty $entry[0] "context_window_tokens" ([int64]$context.context_window)
+  Set-ObjectProperty $previous "codex_sessions" $history
+  $table[$mapKey] = $previous
+  $table | ConvertTo-Json -Depth 6 | Set-Content -Path $mapFile -Encoding UTF8
 }
 
 # Thoi diem khoi dong tien trinh (UTC, round-trip) de phan biet PID bi tai su
@@ -413,8 +472,57 @@ if ($FreshSession) {
   $Session = ""
   $Resume = $false
 }
+
+function Get-CodexHomePath {
+  $homePath = [string]$env:CODEX_HOME
+  if ($homePath) { return $homePath }
+  $profilePath = [string]$env:USERPROFILE
+  if (-not $profilePath) { $profilePath = [Environment]::GetFolderPath("UserProfile") }
+  return (Join-Path $profilePath ".codex")
+}
+
+# Token usage cua Codex la usage cua request gan nhat, khong phai tong lifetime
+# cua thread. So sanh input_tokens voi model_context_window de quyet dinh co
+# con an toan resume cho task moi hay khong.
+function Get-CodexSessionContext($threadId) {
+  $sessionsRoot = Join-Path (Get-CodexHomePath) "sessions"
+  if (-not (Test-Path $sessionsRoot)) { return $null }
+  $files = Get-ChildItem -Path $sessionsRoot -Recurse -Filter *.jsonl -ErrorAction SilentlyContinue |
+    Sort-Object LastWriteTime -Descending
+  foreach ($file in $files) {
+    $meta = Get-FirstJsonLine $file.FullName
+    if (-not $meta -or $meta.type -ne "session_meta" -or $meta.payload.session_id -ne $threadId) { continue }
+    $window = 0L
+    $used = 0L
+    Get-Content -Path $file.FullName -Encoding UTF8 -ErrorAction SilentlyContinue | ForEach-Object {
+      try {
+        $event = $_ | ConvertFrom-Json
+        if ($event.type -eq "event_msg" -and $event.payload.type -eq "task_started" -and $event.payload.model_context_window) {
+          $window = [int64]$event.payload.model_context_window
+        }
+        if ($event.type -eq "token_usage_record" -and $event.payload.usage.input_tokens) {
+          $used = [int64]$event.payload.usage.input_tokens
+        }
+      } catch { }
+    }
+    if ($window -gt 0 -and $used -gt 0) {
+      return @{ used_tokens = $used; context_window = $window; percent = [math]::Round((100.0 * $used / $window), 1) }
+    }
+  }
+  return $null
+}
 if ((-not $FreshSession) -and $Session -eq "") {
   $Session = Get-MappedSession
+}
+if ((-not $FreshSession) -and $Session) {
+  $context = Get-CodexSessionContext $Session
+  if ($context -and $context.percent -ge $contextRolloverPercent) {
+    Write-Output "CONTEXT: Codex thread $Session dang $($context.percent)% ($($context.used_tokens)/$($context.context_window) tokens) - tao phien moi"
+    Retire-CodexSession $Session $context
+    $Session = ""
+    $Resume = $false
+    $FreshSession = $true
+  }
 }
 if ($Resume -and -not $Session) {
     Write-Output "BLOCKED: khong co Codex thread da luu cho task $TaskId trong phien Claude nay."
