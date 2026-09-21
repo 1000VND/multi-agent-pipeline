@@ -29,8 +29,8 @@ cd multi-agent-pipeline
 
 `<repo-dich>` phải là git repo (chạy `git init` trước nếu chưa). Install chạy lại được
 nhiều lần: lần sau cập nhật phần code, giữ nguyên `state.json` và các field riêng của
-`pipeline.config.json`. Riêng schema fallback OpenCode trong config được tự migrate để
-nhận policy model mới. Thêm `-Force` nếu muốn đè cả file dữ liệu — khi đó install in rõ
+`pipeline.config.json`. Schema fallback OpenCode được tự migrate và setting
+`session_rollover.context_percent` được bổ sung nếu chưa có. Thêm `-Force` nếu muốn đè cả file dữ liệu — khi đó install in rõ
 từng file bị đè.
 
 ### -NoGitTrack
@@ -126,7 +126,7 @@ Runner dừng chuỗi khi một model đã sửa file, timeout, hoặc lỗi tha
 
 ## Lane Codex
 
-- Mỗi phiên Claude dùng đúng **một Codex thread**. Runner tự resume thread này ở task
+- Mỗi phiên Claude có **một Codex thread đang hoạt động**. Runner tự resume thread này ở task
   sau và đóng TUI pipeline cũ của repo trước khi mở TUI mới, nên không tích nhiều cửa sổ Codex.
   Dùng `-FreshSession` khi cần chủ động tạo thread mới.
 - Danh tính phiên lấy theo thứ tự `-Key`, `CLAUDE_CODE_HOST_SESSION_ID`,
@@ -155,6 +155,43 @@ Runner dừng chuỗi khi một model đã sửa file, timeout, hoặc lỗi tha
   `<task>-<tag>-native.jsonl`; chế độ headless ghi `<task>-<tag>-codex.jsonl` cộng `.err`
   cho stderr.
 
+## Context và lịch sử session
+
+Cả hai lane kiểm tra context trước khi giao lượt mới. Nếu context **vượt 80%**, runner
+tạo session mới gắn với cùng khóa Claude rồi gửi brief vào session mới. Đúng 80% vẫn
+dùng tiếp. Với OpenCode, kiểm tra cũng chạy trước lượt fallback. Task đang chạy không
+bị ngắt giữa chừng; session mới đọc brief và file của repo, không tự sao chép toàn bộ
+hội thoại cũ. Vì vậy brief sửa lỗi cần ghi đủ tiến độ và việc còn lại.
+
+Ngưỡng có thể chỉnh bằng số nguyên 1–99 trong `.pipeline/pipeline.config.json`
+(thiếu hoặc giá trị không hợp lệ thì dùng 80):
+
+```json
+"session_rollover": { "context_percent": 80 }
+```
+
+Runner dùng usage của request gần nhất và context window do CLI/server cung cấp.
+Tổng token đã tiêu thụ suốt session không dùng làm context. Khi không đọc được usage
+hoặc context window, runner in `CONTEXT:` giải thích và giữ session hiện tại.
+
+Mỗi khóa Claude giữ session đang hoạt động và danh sách **tất cả session đã liên kết**:
+
+| File | Session hiện tại | Lịch sử |
+|---|---|---|
+| `.pipeline/codex-map.json` | `codex_thread` | `codex_sessions[]` |
+| `.pipeline/tui-map.json` | `opencode_session` | `opencode_sessions[]` |
+
+Mỗi mục lịch sử lưu ID, thời điểm ghi nhận/sử dụng và thông tin chuyển phiên khi có.
+Map cũ được nhập vào danh sách khi dùng runner; `-FreshSession` / `-FreshTui` cũng giữ
+ID cũ. Đây là danh bạ session, không phải bản sao lưu toàn bộ hội thoại: nội dung vẫn
+nằm trong kho session của Codex/OpenCode trên máy đó. Các file map được Git ignore,
+nên clone/pull repo sang máy khác không mang theo session của máy hiện tại.
+
+Mở lại một session cũ bằng `codex resume <thread-id>` hoặc
+`opencode attach <URL-server-của-repo> -s <session-id>`. Runner luôn in dòng `TUI:`
+của session được chọn. Chạy ngoài Claude Code cần truyền `-Key <tên-phiên>` cho cả hai
+runner để lịch sử được gắn đúng phiên.
+
 ## Mã thoát
 
 | Mã | Nghĩa |
@@ -169,8 +206,8 @@ Runner dừng chuỗi khi một model đã sửa file, timeout, hoặc lỗi tha
 | 8 | có thay đổi nhưng `test_command` fail |
 | 9 | phiên opencode thuộc repo khác — chặn để khỏi sửa nhầm dự án (chỉ lane OpenCode) |
 | 10 | không giành được run lock: runner Codex khác đang chạy, hoặc lock hỏng/không truy cập được — runner từ chối chạy, không đóng TUI của lượt kia (chỉ lane Codex) |
-| 11 | thiếu danh tính phiên Claude: không có `-Key` và cả hai env `CLAUDE_CODE_*` đều trống — coder không chạy (chỉ lane Codex) |
-| 124 | quá `timeout_sec`. Lane Codex: `codex-run.ps1` thử giết cả cây tiến trình; nếu không giết được thì giữ run lock theo PID còn sống rồi thoát 124. Lane OpenCode: in `TIMEOUT` và báo `exit=124` trong tóm tắt, còn mã thoát cuối theo kết quả (5/0/8). |
+| 11 | thiếu danh tính phiên Claude: không có `-Key` và cả hai env `CLAUDE_CODE_*` đều trống — coder không chạy |
+| 124 | quá `timeout_sec`. Lane Codex: thử giết cả cây tiến trình; nếu không giết được thì giữ run lock theo PID còn sống. Lane OpenCode: dừng lượt và không thử fallback. |
 
 ## Lưu ý
 
@@ -196,5 +233,6 @@ git pull
 
 Phần code trong `.pipeline/bin`, `.claude/agents`, `.claude/skills/pipeline` được copy đè;
 `state.json`, `PROJECT_RULES.md`, `tasks/_TEMPLATE.md` và `.pipeline/.gitignore` giữ
-nguyên trừ khi chạy `-Force`. `pipeline.config.json` giữ các field riêng của project, nhưng
-tự migrate hai chuỗi fallback OpenCode để nhận model policy mới.
+nguyên trừ khi chạy `-Force`. `pipeline.config.json` giữ các field riêng của project,
+tự migrate hai chuỗi fallback OpenCode và thêm `session_rollover.context_percent: 80`
+nếu chưa có. Ngưỡng đã tùy chỉnh được giữ nguyên; không cần dùng `-Force` để nhận cập nhật này.

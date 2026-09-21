@@ -16,9 +16,16 @@ function New-OpenCodeSandbox {
 
   Copy-Item -LiteralPath $script:runnerSource -Destination (Join-Path $bin "oc-run.ps1")
   @'
-param()
+param([string]$Key, [string]$Title, [string]$Url, [string]$Session, [switch]$Fresh, [switch]$NoWindow)
+$count = 0
+if (Test-Path -LiteralPath $env:FAKE_OC_TUI_CALLS) {
+  $count = [int](Get-Content -Raw -LiteralPath $env:FAKE_OC_TUI_CALLS)
+}
+$count++
+Set-Content -LiteralPath $env:FAKE_OC_TUI_CALLS -Value $count
+if ($count -gt 1) { Write-Output "CONTEXT: fixture rollover before fallback" }
 Write-Output "URL=http://127.0.0.1:4096"
-Write-Output "SESSION=fake-session"
+Write-Output "SESSION=fake-session-$count"
 '@ | Set-Content -LiteralPath (Join-Path $bin "oc-tui.ps1") -Encoding UTF8
 
   @'
@@ -47,28 +54,38 @@ exit /b %ERRORLEVEL%
     brief = $brief
     stdinFile = Join-Path $root "received-stdin.txt"
     argsFile = Join-Path $root "received-args.txt"
+    tuiCalls = Join-Path $root "tui-calls.txt"
   }
 }
 
 function Remove-OpenCodeSandbox($sandbox) {
   if ($sandbox -and $sandbox.root -and (Test-Path $sandbox.root)) {
-    Remove-Item -LiteralPath $sandbox.root -Recurse -Force -ErrorAction SilentlyContinue
+    $resolvedRoot = (Resolve-Path -LiteralPath $sandbox.root).Path
+    $tempRoot = [IO.Path]::GetFullPath($env:TEMP).TrimEnd('\') + '\'
+    if (-not $resolvedRoot.StartsWith($tempRoot, [StringComparison]::OrdinalIgnoreCase) -or
+        [IO.Path]::GetFileName($resolvedRoot) -notmatch '^oc-run-test-[a-f0-9]{32}$') {
+      throw "Refusing to delete unexpected test directory '$resolvedRoot'."
+    }
+    Remove-Item -LiteralPath $resolvedRoot -Recurse -Force -ErrorAction SilentlyContinue
   }
 }
 
-function Invoke-OpenCodeRunner($sandbox) {
+function Invoke-OpenCodeRunner($sandbox, [switch]$WithFallback) {
   $saved = @{
     Path = $env:Path
     STDIN = $env:FAKE_OC_STDIN
     ARGS = $env:FAKE_OC_ARGS
+    TUI_CALLS = $env:FAKE_OC_TUI_CALLS
   }
   $env:Path = "$($sandbox.fake);$($saved.Path)"
   $env:FAKE_OC_STDIN = $sandbox.stdinFile
   $env:FAKE_OC_ARGS = $sandbox.argsFile
+  $env:FAKE_OC_TUI_CALLS = $sandbox.tuiCalls
   try {
     Push-Location $sandbox.repo
     try {
-      $text = (& powershell.exe -NoProfile -ExecutionPolicy Bypass -File (Join-Path $sandbox.repo ".pipeline\bin\oc-run.ps1") -TaskFile $sandbox.taskFile -NoTui -NoFallback -OpenCodeCmd (Join-Path $sandbox.fake "opencode.cmd") 2>&1 | Out-String)
+      $fallbackArgs = @(if ($WithFallback) { '-Fallback'; 'fixture/fallback' } else { '-NoFallback' })
+      $text = (& powershell.exe -NoProfile -ExecutionPolicy Bypass -File (Join-Path $sandbox.repo ".pipeline\bin\oc-run.ps1") -TaskFile $sandbox.taskFile -Key "claude-test" -NoTui @fallbackArgs -OpenCodeCmd (Join-Path $sandbox.fake "opencode.cmd") 2>&1 | Out-String)
       return @{ code = $LASTEXITCODE; text = $text }
     } finally {
       Pop-Location
@@ -77,6 +94,26 @@ function Invoke-OpenCodeRunner($sandbox) {
     $env:Path = $saved.Path
     $env:FAKE_OC_STDIN = $saved.STDIN
     $env:FAKE_OC_ARGS = $saved.ARGS
+    $env:FAKE_OC_TUI_CALLS = $saved.TUI_CALLS
+  }
+}
+
+Describe "oc-run fallback session dispatch" {
+  BeforeAll { $fallbackSandbox = New-OpenCodeSandbox }
+  AfterAll { Remove-OpenCodeSandbox $fallbackSandbox }
+
+  It "checks the session before fallback and prints the new TUI hint before dispatch" {
+    $result = Invoke-OpenCodeRunner $fallbackSandbox -WithFallback
+    $result.code | Should Be 5
+    $calls = @(Get-Content -LiteralPath $fallbackSandbox.argsFile)
+    $calls.Count | Should Be 2
+    $calls[0] | Should Match '--session fake-session-1'
+    $calls[1] | Should Match '--session fake-session-2'
+    $calls[1] | Should Match '--model fixture/fallback'
+    [int](Get-Content -Raw -LiteralPath $fallbackSandbox.tuiCalls) | Should Be 2
+    $hintIndex = $result.text.IndexOf('TUI: opencode attach http://127.0.0.1:4096 -s fake-session-2')
+    $dispatchIndex = $result.text.IndexOf('=> opencode fixture/fallback')
+    ($hintIndex -ge 0 -and $dispatchIndex -gt $hintIndex) | Should Be $true
   }
 }
 

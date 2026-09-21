@@ -1,6 +1,6 @@
 ---
 name: pipeline
-description: Chay vong lap plan -> giao viec cho OpenCode hoac Codex -> review -> task tiep theo. Dung khi user muon Claude orchestration va giao phan coding cho mot coding agent.
+description: Lap ke hoach, giao viec cho OpenCode hoac Codex, review roi chuyen task tiep theo. Dung khi user muon Claude orchestration va giao phan coding cho mot coding agent.
 ---
 
 # Pipeline: Claude plan → OpenCode/Codex code → Claude review
@@ -129,7 +129,8 @@ Sau khi runner trả URL/session, luôn chuyển nguyên dòng `TUI: opencode at
 
 Nó đóng cửa sổ CMD đang mở, rồi **tra bản đồ phiên Claude → phiên opencode**:
 
-- Phiên Claude này đã có phiên opencode và phiên đó còn sống → **dùng lại**, giữ nguyên lịch sử
+- Phiên Claude này đã có phiên opencode và context chưa vượt ngưỡng → **dùng lại**
+- Context vượt 80% → tạo phiên mới, giữ ID cũ trong lịch sử của cùng phiên Claude
 - Chưa có, hoặc phiên cũ đã mất trên server → tạo mới rồi ghi vào bản đồ
 
 Nghĩa là mở lại một phiên Claude cũ và giao task tiếp thì cửa sổ TUI quay về đúng phiên
@@ -137,7 +138,8 @@ opencode của nó, không phải phiên trắng. Hai phiên Claude khác nhau g
 riêng, nhưng chỉ một cửa sổ CMD tồn tại tại một thời điểm — cửa sổ luôn thuộc về phiên
 Claude vừa giao việc gần nhất.
 
-Khoá là `CLAUDE_CODE_HOST_SESSION_ID` (fallback `CLAUDE_CODE_SESSION_ID`).
+Khoá ưu tiên `-Key`, rồi `CLAUDE_CODE_HOST_SESSION_ID`, rồi `CLAUDE_CODE_SESSION_ID`.
+Chạy ngoài Claude phải truyền `-Key`; thiếu khoá thì runner thoát `11`.
 Bản đồ: `.pipeline/tui-map.json`. Cửa sổ đang mở: `.pipeline/tui.json`.
 
 **Mỗi repo một server riêng:** server opencode gắn chặt với thư mục nó được khởi động, nên
@@ -151,6 +153,7 @@ song được, mỗi repo chiếm một cổng trong dải. Nếu runner in
 **Đánh đổi khi dùng lại phiên:** context của opencode tích lũy qua các task, tốn thêm
 input token và có thể lẫn chỉ dẫn của task cũ. Khi muốn bắt đầu sạch cho một task,
 thêm `-FreshTui` để ép tạo phiên opencode mới cho phiên Claude này.
+Runner tự kiểm tra ngưỡng trước mỗi lượt, kể cả fallback; `-FreshTui` vẫn giữ ID cũ.
 
 KHÔNG tự `Stop-Process` cửa sổ nào ngoài PID ghi trong `tui.json`.
 
@@ -162,7 +165,7 @@ Gọi subagent `oc-coder` với đường dẫn brief. (Qua subagent để log O
 powershell -NoProfile -File .pipeline/bin/codex-run.ps1 -TaskFile .pipeline/tasks/<id>.md
 ```
 
-Mỗi phiên Claude được gắn với **một Codex thread**. Lần giao task đầu tạo thread; các
+Mỗi phiên Claude được gắn với **một Codex thread đang hoạt động**. Lần giao task đầu tạo thread; các
 lần sau tự resume đúng thread đó, kể cả khi không truyền `-Resume`. Mặc định runner mở **TUI gốc của Codex**
 (`codex --approve-for-me -C <repo> "<prompt trỏ tới brief>"`) để người dùng thấy đúng
 giao diện Codex đang làm việc. `-Exec` hoặc `-NoTui` chạy headless (`codex exec`)
@@ -177,7 +180,7 @@ pipeline trong mỗi repo tồn tại tại một thời điểm và nó luôn t
 giao việc gần nhất. Bản đồ TUI lưu cả PID lẫn thời điểm khởi động của tiến trình; runner
 chỉ đóng khi PID còn sống, đúng tên `codex` và đúng thời điểm khởi động, còn bản ghi cũ
 thiếu thời điểm khởi động thì bỏ qua để không giết nhầm PID đã bị tái sử dụng. Dùng
-`-FreshSession` khi thật sự cần bỏ lịch sử và tạo thread Codex mới (ví dụ lúc leo thang model).
+`-FreshSession` khi cần context mới (ví dụ lúc leo thang model); ID thread cũ vẫn được lưu.
 Khi headless có thread, runner in `TUI: codex resume <thread-id>`; chuyển nguyên dòng này cho người dùng để họ tự mở lại đúng TUI.
 
 Việc đóng TUI cũ rồi mở TUI mới chỉ an toàn khi các lượt chạy **tuần tự**, nên runner
@@ -212,6 +215,25 @@ vào `codex-map.json` ngay khi nhận ra (TUI: từ rollout,
 exec: khi `thread.started` xuất hiện), nên `-Resume` vẫn dùng được kể cả khi lượt trước
 chết giữa chừng. Ở chế độ `-Exec`, stderr của Codex nằm ở file `<log>.err` cạnh file
 JSONL; ở chế độ TUI, rollout được sao chép vào `.pipeline/logs/<base>-<tag>-native.jsonl`.
+
+#### Rollover context và tra cứu session cũ
+
+Hai runner tự tạo session mới trước lượt kế tiếp khi context **>80%**; đúng 80% vẫn
+dùng tiếp. Ngưỡng lấy từ `session_rollover.context_percent` trong config, thiếu thì
+dùng 80. Không ngắt task đang chạy. Số liệu là context request gần nhất, không phải
+tổng token tính phí của cả session. Nếu thiếu telemetry, runner in `CONTEXT:` và giữ
+session hiện tại; không tự đoán tỷ lệ hay tự tạo lại thêm session.
+
+Brief của mỗi lượt, kể cả `-Resume`, phải tự chứa mục tiêu, tiến độ và việc còn lại:
+session sau rollover đọc lại brief và file repo, không tự nhận toàn bộ hội thoại cũ.
+Chuyển ngay dòng `CONTEXT:` khi rollover và dòng `TUI:` mới cho người dùng.
+
+Lịch sử ID của cùng khóa Claude nằm trong `codex_sessions[]` tại
+`.pipeline/codex-map.json` và `opencode_sessions[]` tại `.pipeline/tui-map.json`.
+Các field `codex_thread` / `opencode_session` chỉ session đang hoạt động. Không xóa
+map hoặc session cũ khi rollover; cả `-FreshSession` / `-FreshTui` cũng giữ lịch sử.
+Nội dung hội thoại do CLI lưu trên máy, còn map lưu liên kết để có thể mở lại bằng
+`codex resume <id>` hoặc `opencode attach <URL> -s <id>`.
 
 ### c) Review
 

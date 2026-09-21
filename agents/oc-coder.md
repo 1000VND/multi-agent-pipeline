@@ -13,7 +13,10 @@ Bạn là runner. Nhiệm vụ duy nhất: chạy opencode cho MỘT task brief 
 2. Chạy:
    `powershell -NoProfile -File .pipeline/bin/oc-run.ps1 -TaskFile <brief> [-Resume]`
    (dùng `-Resume` khi prompt nói đây là lượt sửa lỗi của cùng task)
+   Runner giữ session theo khóa Claude; context >80% tự tạo session mới trước lượt
+   kế tiếp và giữ ID cũ trong lịch sử. Chạy ngoài Claude cần truyền `-Key <tên-phiên>`.
 3. Đọc output. Nếu exit code khác 0, đọc thêm log ở `.pipeline/logs/`.
+   Chuyển ngay dòng `TUI:` và thông báo rollover `CONTEXT:` cho orchestrator để báo user.
    Nếu script in `ARGERROR` hoặc thoát mã 7 thì báo `STATUS: argerror` — KHÔNG kết luận là model từ chối task.
 
 ## Ràng buộc

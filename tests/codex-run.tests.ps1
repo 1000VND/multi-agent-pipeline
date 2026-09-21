@@ -17,6 +17,11 @@ using System.Threading;
 class FakeCodex {
     static int Main(string[] args) {
         string baseDir = AppDomain.CurrentDomain.BaseDirectory;
+        if (string.Equals(Path.GetFileName(Environment.GetCommandLineArgs()[0]), "taskkill.exe", StringComparison.OrdinalIgnoreCase)) {
+            // Deterministic kill-denied fixture. Never sends a signal to a real process.
+            File.AppendAllText(Path.Combine(baseDir, "taskkill-calls.txt"), string.Join("|", args) + Environment.NewLine);
+            return 1;
+        }
         string thread = Environment.GetEnvironmentVariable("FAKE_CODEX_THREAD");
         if (string.IsNullOrEmpty(thread)) { thread = "fake-default"; }
         for (int i = 0; i < args.Length; i++) {
@@ -94,6 +99,7 @@ function New-Sandbox {
   New-Item -ItemType Directory -Force -Path $repo, $fake, $out, (Join-Path $codexHome "sessions") | Out-Null
   New-Item -ItemType Directory -Force -Path (Join-Path $repo ".pipeline\bin"), (Join-Path $repo ".pipeline\tasks"), (Join-Path $repo ".pipeline\logs") | Out-Null
   Copy-Item -LiteralPath (Get-FakeExeSource) -Destination (Join-Path $fake "codex.exe") -Force
+  Copy-Item -LiteralPath (Get-FakeExeSource) -Destination (Join-Path $fake "taskkill.exe") -Force
   Set-Content -Path (Join-Path $repo ".pipeline\tasks\t1.md") -Value "Brief test" -Encoding UTF8
   Copy-Item -LiteralPath (Join-Path $script:packageRoot "templates\pipeline.gitignore") -Destination (Join-Path $repo ".pipeline\.gitignore") -Force
   & git -C $repo init -q 2>$null | Out-Null
@@ -104,19 +110,36 @@ function New-Sandbox {
   return @{ root = $root; repo = $repo; fake = $fake; out = $out; codexHome = $codexHome }
 }
 
+function Assert-TestDirectory($path, $prefix) {
+  $fullPath = [IO.Path]::GetFullPath([string]$path).TrimEnd('\')
+  $tempRoot = [IO.Path]::GetFullPath($env:TEMP).TrimEnd('\')
+  $parent = [IO.Path]::GetDirectoryName($fullPath)
+  $leaf = [IO.Path]::GetFileName($fullPath)
+  if (-not [IO.Path]::IsPathRooted($path) -or
+      -not [string]::Equals($parent, $tempRoot, [StringComparison]::OrdinalIgnoreCase) -or
+      $leaf -notmatch ('^' + [regex]::Escape($prefix) + '[0-9a-f]{32}$')) {
+    throw "Refuse cleanup outside an explicitly named test directory: $path"
+  }
+  return $fullPath
+}
+
 function Remove-Sandbox($sandbox) {
   if (-not $sandbox -or -not $sandbox.fake) { return }
+  $testRoot = Assert-TestDirectory $sandbox.root "codex-run-test-"
+  $fakeExe = Join-Path $testRoot "fake\codex.exe"
   Get-Process -Name codex -ErrorAction SilentlyContinue |
-    Where-Object { $_.Path -and $_.Path.StartsWith($sandbox.fake, [StringComparison]::OrdinalIgnoreCase) } |
+    Where-Object { $_.Path -and [string]::Equals($_.Path, $fakeExe, [StringComparison]::OrdinalIgnoreCase) } |
     Stop-Process -Force -ErrorAction SilentlyContinue
-  if ($sandbox.root -and (Test-Path $sandbox.root)) {
-    Remove-Item -LiteralPath $sandbox.root -Recurse -Force -ErrorAction SilentlyContinue
+  if (Test-Path -LiteralPath $testRoot) {
+    Remove-Item -LiteralPath $testRoot -Recurse -Force -ErrorAction SilentlyContinue
   }
 }
 
 function Reset-State($sandbox) {
+  $testRoot = Assert-TestDirectory $sandbox.root "codex-run-test-"
+  $fakeExe = Join-Path $testRoot "fake\codex.exe"
   Get-Process -Name codex -ErrorAction SilentlyContinue |
-    Where-Object { $_.Path -and $_.Path.StartsWith($sandbox.fake, [StringComparison]::OrdinalIgnoreCase) } |
+    Where-Object { $_.Path -and [string]::Equals($_.Path, $fakeExe, [StringComparison]::OrdinalIgnoreCase) } |
     Stop-Process -Force -ErrorAction SilentlyContinue
   $map = Join-Path $sandbox.repo ".pipeline\codex-map.json"
   if (Test-Path $map) { Remove-Item -LiteralPath $map -Force }
@@ -124,6 +147,11 @@ function Reset-State($sandbox) {
   if (Test-Path $lock) { Remove-Item -LiteralPath $lock -Force }
   $calls = Join-Path $sandbox.fake "calls.txt"
   if (Test-Path $calls) { Remove-Item -LiteralPath $calls -Force }
+  $killCalls = Join-Path $sandbox.fake "taskkill-calls.txt"
+  if (Test-Path $killCalls) { Remove-Item -LiteralPath $killCalls -Force }
+  # Moi case context chi duoc doc rollout fixture cua chinh no.
+  Get-ChildItem -LiteralPath (Join-Path $sandbox.codexHome "sessions") -Filter *.jsonl |
+    Remove-Item -Force
 }
 
 function Invoke-Runner {
@@ -136,6 +164,7 @@ function Invoke-Runner {
     [string]$Thread = "",
     [string]$ClaudeHost = "",
     [string]$ClaudeSession = "",
+    [string]$Session = "",
     [switch]$Sleep,
     [switch]$Touch,
     [string]$CodexHome = "",
@@ -157,7 +186,8 @@ function Invoke-Runner {
   $env:FAKE_CODEX_THREAD = $null
   $env:FAKE_CODEX_SLEEP = $null
   $env:FAKE_CODEX_TOUCH = $null
-  $env:CODEX_HOME = $null
+  # Tuyet doi khong fallback sang rollout that trong USERPROFILE khi test.
+  $env:CODEX_HOME = $Sandbox.codexHome
   $env:FAKE_CODEX_SESSIONS_ROOT = $null
   if ($ClaudeHost) { $env:CLAUDE_CODE_HOST_SESSION_ID = $ClaudeHost }
   if ($ClaudeSession) { $env:CLAUDE_CODE_SESSION_ID = $ClaudeSession }
@@ -166,8 +196,9 @@ function Invoke-Runner {
   if ($Touch) { $env:FAKE_CODEX_TOUCH = "1" }
   if ($CodexHome) { $env:CODEX_HOME = $CodexHome }
   if ($WriteRollout) { $env:FAKE_CODEX_SESSIONS_ROOT = (Join-Path $Sandbox.codexHome "sessions") }
-  $argList = @("-NoProfile", "-File", $script:runnerPath, "-TaskFile", (Join-Path $Sandbox.repo ".pipeline\tasks\t1.md"))
+  $argList = @("-NoProfile", "-ExecutionPolicy", "Bypass", "-File", $script:runnerPath, "-TaskFile", (Join-Path $Sandbox.repo ".pipeline\tasks\t1.md"))
   if ($Key) { $argList += @("-Key", $Key) }
+  if ($Session) { $argList += @("-Session", $Session) }
   if ($FreshSession) { $argList += "-FreshSession" }
   if ($NoTui) { $argList += "-NoTui" }
   if ($TimeoutSec -gt 0) { $argList += @("-TimeoutSec", [string]$TimeoutSec) }
@@ -181,6 +212,11 @@ function Invoke-Runner {
   } finally {
     Pop-Location
   }
+    if ($runnerCode -in @(1, 7)) {
+      Write-Warning ("runner exit {0}:`n{1}`n{2}" -f $runnerCode,
+        [string](Get-Content -Raw -ErrorAction SilentlyContinue $outPath),
+        [string](Get-Content -Raw -ErrorAction SilentlyContinue $errPath))
+    }
     return @{
       code = $runnerCode
       text = [string](Get-Content -Raw -ErrorAction SilentlyContinue $outPath)
@@ -219,6 +255,41 @@ function Get-Map($sandbox) {
   $p = Join-Path $sandbox.repo ".pipeline\codex-map.json"
   if (-not (Test-Path $p)) { return $null }
   try { return (Get-Content -Raw -Encoding UTF8 $p | ConvertFrom-Json) } catch { return $null }
+}
+
+function Set-SessionMap($sandbox, $map) {
+  $map | ConvertTo-Json -Depth 20 | Set-Content -LiteralPath (Join-Path $sandbox.repo ".pipeline\codex-map.json") -Encoding UTF8
+}
+
+function Write-CodexRollout {
+  param(
+    [hashtable]$Sandbox,
+    [string]$Thread,
+    [object[]]$Events,
+    [switch]$NativeId,
+    [string]$ParentSession = ""
+  )
+  $payload = @{ cwd = $Sandbox.repo }
+  if ($NativeId) { $payload.id = $Thread } else { $payload.session_id = $Thread }
+  if ($ParentSession) { $payload.session_id = $ParentSession }
+  $rows = @(@{ type = "session_meta"; payload = $payload }) + $Events
+  $path = Join-Path $Sandbox.codexHome ("sessions\rollout-" + [guid]::NewGuid().ToString("N") + ".jsonl")
+  @($rows | ForEach-Object { ConvertTo-Json -InputObject $_ -Depth 20 -Compress }) |
+    Set-Content -LiteralPath $path -Encoding UTF8
+}
+
+function New-OldTokenUsage($inputTokens, $windowTokens = 100000, $lifetimeTokens = 900000, $outputTokens = 0) {
+  return @{
+    type = "event_msg"
+    payload = @{
+      type = "token_count"
+      info = @{
+        model_context_window = $windowTokens
+        last_token_usage = @{ input_tokens = $inputTokens; output_tokens = $outputTokens; total_tokens = $inputTokens + $outputTokens }
+        total_token_usage = @{ input_tokens = $lifetimeTokens; output_tokens = 10000; total_tokens = $lifetimeTokens + 10000 }
+      }
+    }
+  }
 }
 
 function Set-TuiRecord($sandbox, $pidValue, $procStarted) {
@@ -352,6 +423,194 @@ Describe "codex-run session identity" {
   }
 }
 
+Describe "codex-run context rollover and session history" {
+  BeforeAll {
+    $sandbox = New-Sandbox
+  }
+  AfterAll {
+    Remove-Sandbox $sandbox
+  }
+  BeforeEach {
+    Reset-State $sandbox
+    Set-SessionMap $sandbox @{ "context-claude" = @{ codex_thread = "thread-old"; session_key = "context-claude"; last_used = "2024-01-01T00:00:00" } }
+  }
+
+  It "old token_count dung request cuoi, khong cong usage lifetime hay cached input" {
+    Write-CodexRollout -Sandbox $sandbox -Thread "thread-old" -Events @(
+      (New-OldTokenUsage 95000),
+      (New-OldTokenUsage 50000 100000 3000000)
+    )
+    $r = Invoke-Runner -Sandbox $sandbox -Key "context-claude" -Thread "thread-unused" -NoTui
+    $r.code | Should Be 5
+    (Get-CallArgs @(Get-FakeCalls $sandbox)[0]) | Should Match "\|resume\|"
+    (Get-Map $sandbox).'context-claude'.codex_thread | Should Be "thread-old"
+    @((Get-Map $sandbox).'context-claude'.codex_sessions).Count | Should Be 1
+  }
+
+  It "dung 80 phan tram thi van resume, chua tao session moi" {
+    Write-CodexRollout -Sandbox $sandbox -Thread "thread-old" -Events @((New-OldTokenUsage 80000))
+    $r = Invoke-Runner -Sandbox $sandbox -Key "context-claude" -Thread "thread-unused" -NoTui
+    $r.code | Should Be 5
+    (Get-CallArgs @(Get-FakeCalls $sandbox)[0]) | Should Match "\|thread-old\|-$"
+    (Get-Map $sandbox).'context-claude'.codex_thread | Should Be "thread-old"
+  }
+
+  It "80.001 phan tram tao session moi va luu ca thread cu du hien thi lam tron thanh 80" {
+    Write-CodexRollout -Sandbox $sandbox -Thread "thread-old" -Events @((New-OldTokenUsage 80001))
+    $r = Invoke-Runner -Sandbox $sandbox -Key "context-claude" -Thread "thread-new" -NoTui
+    $r.code | Should Be 5
+    (Get-CallArgs @(Get-FakeCalls $sandbox)[0]) | Should Not Match "\|resume\|"
+    $record = (Get-Map $sandbox).'context-claude'
+    $record.codex_thread | Should Be "thread-new"
+    @($record.codex_sessions).Count | Should Be 2
+    ($record.codex_sessions.thread_id -contains "thread-old") | Should Be $true
+    ($record.codex_sessions.thread_id -contains "thread-new") | Should Be $true
+    $old = $record.codex_sessions | Where-Object { $_.thread_id -eq "thread-old" }
+    $old.retired_reason | Should Match "context"
+    $old.last_context_tokens | Should Be 80001
+    $old.context_window_tokens | Should Be 100000
+    # Legacy chi biet last_used, khong duoc bien no thanh thoi diem tao thread.
+    $old.created_at | Should BeNullOrEmpty
+    $r.text | Should Match "TUI: codex resume thread-new"
+  }
+
+  It "latest request gom output tokens khi xet vuot nguong" {
+    Write-CodexRollout -Sandbox $sandbox -Thread "thread-old" -Events @((New-OldTokenUsage 79995 100000 3000000 10))
+    $r = Invoke-Runner -Sandbox $sandbox -Key "context-claude" -Thread "thread-new" -NoTui
+    $r.code | Should Be 5
+    (Get-Map $sandbox).'context-claude'.codex_thread | Should Be "thread-new"
+  }
+
+  It "schema moi dung task_started va token_usage_record voi session_meta.id" {
+    Write-CodexRollout -Sandbox $sandbox -Thread "thread-old" -NativeId -Events @(
+      @{ type = "event_msg"; payload = @{ type = "task_started"; model_context_window = 100000 } },
+      @{ type = "token_usage_record"; payload = @{ usage = @{ input_tokens = 85000; cached_input_tokens = 60000; output_tokens = 100; total_tokens = 85100 } } }
+    )
+    $r = Invoke-Runner -Sandbox $sandbox -Key "context-claude" -Thread "thread-new" -NoTui
+    $r.code | Should Be 5
+    (Get-Map $sandbox).'context-claude'.codex_thread | Should Be "thread-new"
+    $old = (Get-Map $sandbox).'context-claude'.codex_sessions | Where-Object { $_.thread_id -eq "thread-old" }
+    $old.last_context_tokens | Should Be 85100
+  }
+
+  It "schema moi khong dem cache them mot lan nua va dung usage cuoi" {
+    Write-CodexRollout -Sandbox $sandbox -Thread "thread-old" -NativeId -Events @(
+      @{ type = "event_msg"; payload = @{ type = "task_started"; model_context_window = 100000 } },
+      @{ type = "token_usage_record"; payload = @{ usage = @{ input_tokens = 91000; output_tokens = 100 } } },
+      @{ type = "token_usage_record"; payload = @{ usage = @{ input_tokens = 60000; cached_input_tokens = 50000; output_tokens = 1000; total_tokens = 61000 } } }
+    )
+    $r = Invoke-Runner -Sandbox $sandbox -Key "context-claude" -Thread "thread-unused" -NoTui
+    $r.code | Should Be 5
+    (Get-Map $sandbox).'context-claude'.codex_thread | Should Be "thread-old"
+  }
+
+  It "sau compact khong dung lai usage cu de rollover khi chua co usage moi" {
+    Write-CodexRollout -Sandbox $sandbox -Thread "thread-old" -Events @(
+      (New-OldTokenUsage 99000),
+      @{ type = "compacted"; payload = @{ message = "Summary replaces previous context." } },
+      @{ type = "event_msg"; payload = @{ type = "task_started"; model_context_window = 100000 } }
+    )
+    $r = Invoke-Runner -Sandbox $sandbox -Key "context-claude" -Thread "thread-unused" -NoTui
+    $r.code | Should Be 5
+    (Get-Map $sandbox).'context-claude'.codex_thread | Should Be "thread-old"
+    $r.text | Should Match "CONTEXT:.*khong.*giu phien"
+  }
+
+  It "usage moi sau compact lai duoc dung de rollover" {
+    Write-CodexRollout -Sandbox $sandbox -Thread "thread-old" -Events @(
+      (New-OldTokenUsage 99000),
+      @{ type = "compacted"; payload = @{ message = "Summary." } },
+      (New-OldTokenUsage 81000)
+    )
+    $r = Invoke-Runner -Sandbox $sandbox -Key "context-claude" -Thread "thread-new" -NoTui
+    $r.code | Should Be 5
+    (Get-Map $sandbox).'context-claude'.codex_thread | Should Be "thread-new"
+  }
+
+  It "session_meta.id cua subagent khac parent session_id khong bi tinh vao context parent" {
+    Write-CodexRollout -Sandbox $sandbox -Thread "thread-old" -NativeId -Events @((New-OldTokenUsage 40000))
+    Write-CodexRollout -Sandbox $sandbox -Thread "thread-child" -NativeId -ParentSession "thread-old" -Events @((New-OldTokenUsage 99000))
+    $r = Invoke-Runner -Sandbox $sandbox -Key "context-claude" -Thread "thread-unused" -NoTui
+    $r.code | Should Be 5
+    (Get-Map $sandbox).'context-claude'.codex_thread | Should Be "thread-old"
+  }
+
+  It "thieu usage thi canh bao va giu session, khong tu gia dinh day context" {
+    Write-CodexRollout -Sandbox $sandbox -Thread "thread-old" -Events @(
+      @{ type = "event_msg"; payload = @{ type = "task_started"; model_context_window = 100000 } }
+    )
+    $r = Invoke-Runner -Sandbox $sandbox -Key "context-claude" -Thread "thread-unused" -NoTui
+    $r.code | Should Be 5
+    (Get-Map $sandbox).'context-claude'.codex_thread | Should Be "thread-old"
+    $r.text | Should Match "CONTEXT:.*khong.*giu phien"
+    @((Get-Map $sandbox).'context-claude'.codex_sessions).Count | Should Be 1
+  }
+
+  It "FreshSession nhieu lan giu tat ca thread va lan resume khong them trung lich su" {
+    [void](Invoke-Runner -Sandbox $sandbox -Key "context-claude" -Thread "thread-two" -FreshSession -NoTui)
+    [void](Invoke-Runner -Sandbox $sandbox -Key "context-claude" -Thread "thread-three" -FreshSession -NoTui)
+    $r = Invoke-Runner -Sandbox $sandbox -Key "context-claude" -Thread "thread-unused" -NoTui
+    $r.code | Should Be 5
+    $record = (Get-Map $sandbox).'context-claude'
+    $record.codex_thread | Should Be "thread-three"
+    @($record.codex_sessions).Count | Should Be 3
+    (@($record.codex_sessions.thread_id | Sort-Object) -join ",") | Should Be "thread-old,thread-three,thread-two"
+    @($record.codex_sessions | Where-Object { $_.thread_id -ne "thread-old" -and (-not $_.created_at -or -not $_.last_used) }).Count | Should Be 0
+  }
+
+  It "migrate nhieu legacy task key thanh lich su chung va giu rieng phien Claude khac" {
+    Set-SessionMap $sandbox @{
+      "legacy-claude::first" = @{ codex_thread = "thread-one"; session_key = "legacy-claude"; last_used = "2024-01-01T00:00:00" }
+      "legacy-claude::second" = @{ codex_thread = "thread-two"; session_key = "legacy-claude"; last_used = "2024-01-02T00:00:00" }
+      "other-claude::third" = @{ codex_thread = "thread-unrelated"; session_key = "other-claude"; last_used = "2024-01-03T00:00:00" }
+    }
+    $r = Invoke-Runner -Sandbox $sandbox -Key "legacy-claude" -Thread "thread-unused" -NoTui
+    $r.code | Should Be 5
+    $map = Get-Map $sandbox
+    $map.'legacy-claude'.codex_thread | Should Be "thread-two"
+    (@($map.'legacy-claude'.codex_sessions.thread_id | Sort-Object) -join ",") | Should Be "thread-one,thread-two"
+    $map.'other-claude::third'.codex_thread | Should Be "thread-unrelated"
+    (Get-CallArgs @(Get-FakeCalls $sandbox)[0]) | Should Match "\|thread-two\|-$"
+  }
+
+  It "Session chi dinh thu cong duoc them lich su va giu ca active thread truoc do" {
+    $r = Invoke-Runner -Sandbox $sandbox -Key "context-claude" -Session "thread-selected" -NoTui
+    $r.code | Should Be 5
+    $record = (Get-Map $sandbox).'context-claude'
+    $record.codex_thread | Should Be "thread-selected"
+    (@($record.codex_sessions.thread_id | Sort-Object) -join ",") | Should Be "thread-old,thread-selected"
+    (Get-CallArgs @(Get-FakeCalls $sandbox)[0]) | Should Match "\|thread-selected\|-$"
+  }
+
+  It "Session chi dinh da vuot nguong van duoc luu truoc khi tao thread thay the" {
+    Write-CodexRollout -Sandbox $sandbox -Thread "thread-selected" -Events @((New-OldTokenUsage 90000))
+    $r = Invoke-Runner -Sandbox $sandbox -Key "context-claude" -Session "thread-selected" -Thread "thread-replacement" -NoTui
+    $r.code | Should Be 5
+    $record = (Get-Map $sandbox).'context-claude'
+    $record.codex_thread | Should Be "thread-replacement"
+    (@($record.codex_sessions.thread_id | Sort-Object) -join ",") | Should Be "thread-old,thread-replacement,thread-selected"
+  }
+
+  It "Session cu the van phai co khoa Claude, neu thieu thi chan truoc khi goi Codex" {
+    $r = Invoke-Runner -Sandbox $sandbox -Session "thread-selected" -NoTui
+    $r.code | Should Be 11
+    $r.text | Should Match "BLOCKED:.*-Key"
+    (Get-FakeCalls $sandbox).Count | Should Be 0
+  }
+
+  It "map JSON hong voi FreshSession bi chan truoc khi dispatch va giu nguyen lich su" {
+    $mapPath = Join-Path $sandbox.repo ".pipeline\codex-map.json"
+    Set-Content -LiteralPath $mapPath -Value '{"context-claude":BROKEN' -Encoding UTF8
+    $original = [IO.File]::ReadAllText($mapPath)
+    $r = Invoke-Runner -Sandbox $sandbox -Key "context-claude" -Thread "must-not-start" -FreshSession -NoTui
+    $r.code | Should Be 1
+    ($r.text + $r.err) | Should Match "BLOCKED: khong doc duoc"
+    (Get-FakeCalls $sandbox).Count | Should Be 0
+    [IO.File]::ReadAllText($mapPath) | Should Be $original
+    (Test-Path (Join-Path $sandbox.repo ".pipeline\logs\codex-run.lock")) | Should Be $false
+  }
+}
+
 Describe "codex-run TUI PID safety" {
   BeforeAll {
     $sandbox = New-Sandbox
@@ -371,6 +630,7 @@ Describe "codex-run TUI PID safety" {
     $r = Invoke-Runner -Sandbox $sandbox -Key "tui-key" -TimeoutSec 2
     $r.code | Should Be 10
     $r.text | Should Match "BLOCKED: khong dong duoc TUI Codex cu"
+    (Get-Content -LiteralPath (Join-Path $sandbox.fake "taskkill-calls.txt")) | Should Be "/PID|$($victim.proc.Id)|/T|/F"
     (Test-ProcessAlive $victim.proc.Id) | Should Be $true
     Stop-FakeProcess $victim.proc
   }
@@ -490,7 +750,61 @@ Describe "codex-run test cleanup" {
   AfterAll {
     Remove-Sandbox $script:sandboxIdentity
     if ($script:fakeSourceDir -and (Test-Path $script:fakeSourceDir)) {
-      Remove-Item -LiteralPath $script:fakeSourceDir -Recurse -Force -ErrorAction SilentlyContinue
+      $fakeRoot = Assert-TestDirectory $script:fakeSourceDir "codex-run-fake-"
+      Remove-Item -LiteralPath $fakeRoot -Recurse -Force -ErrorAction SilentlyContinue
+    }
+  }
+}
+
+Describe "codex-run rapid process exit code" {
+  BeforeAll {
+    $parseErrors = $null
+    $ast = [Management.Automation.Language.Parser]::ParseFile($script:runnerPath, [ref]$null, [ref]$parseErrors)
+    $function = $ast.Find({ param($node) $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq 'Start-CodexExec' }, $true)
+    . ([scriptblock]::Create($function.Extent.Text))
+  }
+
+  It "retains actual success and failure exit codes even for immediately exiting processes" {
+    $rapidRoot = Join-Path $env:TEMP ('codex-run-test-' + [guid]::NewGuid().ToString('N'))
+    New-Item -ItemType Directory -Path $rapidRoot | Out-Null
+    try {
+      $inputFile = Join-Path $rapidRoot 'input.txt'
+      Set-Content -LiteralPath $inputFile -Value 'brief' -Encoding UTF8
+      foreach ($expectedCode in @(0, 23, 0, 23)) {
+        $process = Start-CodexExec 'cmd.exe' "/d /c exit $expectedCode" $rapidRoot $inputFile (Join-Path $rapidRoot 'out.log') (Join-Path $rapidRoot 'err.log')
+        try { $process.Complete() | Should Be $expectedCode }
+        finally { $process.Dispose() }
+      }
+    } finally {
+      $validatedRoot = Assert-TestDirectory $rapidRoot 'codex-run-test-'
+      Remove-Item -LiteralPath $validatedRoot -Recurse -Force
+    }
+  }
+
+  It "pumps a long UTF-8 brief and concurrent output without deadlocking or losing bytes" {
+    $rapidRoot = Join-Path $env:TEMP ('codex-run-test-' + [guid]::NewGuid().ToString('N'))
+    New-Item -ItemType Directory -Path $rapidRoot | Out-Null
+    try {
+      $inputFile = Join-Path $rapidRoot 'input.txt'
+      $outputFile = Join-Path $rapidRoot 'out.log'
+      $errorFile = Join-Path $rapidRoot 'err.log'
+      $brief = ('Long brief ' + [char]0x1EC7 + ' ') * 20000
+      [IO.File]::WriteAllText($inputFile, $brief, [Text.UTF8Encoding]::new($false))
+      $command = '[Console]::InputEncoding=[Text.UTF8Encoding]::new($false); [Console]::OutputEncoding=[Text.UTF8Encoding]::new($false); [Console]::Error.Write(("e" * 100000)); [Console]::Out.Write([Console]::In.ReadToEnd()); exit 23'
+      $encoded = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($command))
+      $process = Start-CodexExec 'powershell.exe' "-NoProfile -EncodedCommand $encoded" $rapidRoot $inputFile $outputFile $errorFile
+      try {
+        $process.Process.WaitForExit(10000) | Should Be $true
+        $process.Complete() | Should Be 23
+        [IO.File]::ReadAllText($outputFile) | Should Be $brief
+        ([IO.File]::ReadAllText($errorFile)).Length | Should Be 100000
+      } finally {
+        if (-not $process.Process.HasExited) { $process.Process.Kill() }
+        $process.Dispose()
+      }
+    } finally {
+      $validatedRoot = Assert-TestDirectory $rapidRoot 'codex-run-test-'
+      Remove-Item -LiteralPath $validatedRoot -Recurse -Force
     }
   }
 }

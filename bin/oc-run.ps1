@@ -4,7 +4,7 @@
   Muc dich: Claude khong phai nuot toan bo stdout cua opencode.
 
   Model mac dinh: deepseek-v4.1-flash (variant max).
-  Fallback: mimo-v2.5-pro - chi chay khi luot dau KHONG sinh ra thay doi nao.
+  Fallback: chuoi model trong config, tach rieng khi khong sua file va khi het quota.
 #>
 param(
   [Parameter(Mandatory = $true)][string]$TaskFile,
@@ -17,6 +17,7 @@ param(
   [switch]$Resume,
   [string]$Attach  = "",  # vd http://127.0.0.1:4096 de ban xem live qua TUI/web
   [string]$Session = "",  # ghim session ID de moi lenh roi vao DUNG phien ban dang attach
+  [string]$Key = "",      # khoa phien Claude khi khong co CLAUDE_CODE_*_SESSION_ID
   [switch]$NewTui,        # co cu: TUI gio bat mac dinh, tham so nay khong con tac dung rieng
   [switch]$FreshTui,      # kem -NewTui: ep tao phien opencode moi thay vi dung lai phien cu
   [switch]$NoTui,         # tat han cua so TUI (mac dinh la bat)
@@ -26,6 +27,13 @@ param(
 
 $ErrorActionPreference = "Stop"
 $fallbackOverrideRequested = $PSBoundParameters.ContainsKey("Fallback")
+$initialSession = $Session
+if ([string]::IsNullOrWhiteSpace($Key)) { $Key = $env:CLAUDE_CODE_HOST_SESSION_ID }
+if ([string]::IsNullOrWhiteSpace($Key)) { $Key = $env:CLAUDE_CODE_SESSION_ID }
+if ([string]::IsNullOrWhiteSpace($Key)) {
+  Write-Output "BLOCKED: khong co CLAUDE_CODE_*_SESSION_ID. Truyen -Key <claude-session-id> de tranh lan lich su."
+  exit 11
+}
 $repo = (& git rev-parse --show-toplevel 2>$null)
 if (-not $repo) { Write-Output "Khong phai git repo. Pipeline nay bat buoc dung git."; exit 2 }
 
@@ -160,27 +168,39 @@ function Assert-SessionRepo($attachUrl, $sid) {
 # Nguoi goi ghim san -Attach/-Session: kiem ngay truoc khi mo TUI.
 if (($Attach -ne "") -and ($Session -ne "")) { Assert-SessionRepo $Attach $Session }
 
-# Luon lay/tao session truoc khi giao task. Headless chi bo qua viec mo CMD,
-# van in lenh attach de nguoi dung co the mo lai TUI sau khi da dong nham.
-$tuiArgs = @()
-if ($Attach -ne "") { $tuiArgs += @("-Url", $Attach) }
-$tuiArgs += @("-Title", "Task $([IO.Path]::GetFileNameWithoutExtension($TaskFile))")
-if ($FreshTui) { $tuiArgs += "-Fresh" }
-if ($NoTui) { $tuiArgs += "-NoWindow" }
-$tui = & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $PSScriptRoot "oc-tui.ps1") @tuiArgs
-$tui | ForEach-Object { Write-Output $_ }
-$line = $tui | Where-Object { $_ -match "^SESSION=" } | Select-Object -Last 1
-if (-not $line) { Write-Error "oc-tui.ps1 khong tra ve session id."; exit 6 }
-$Session = $line -replace "^SESSION=", ""
-$urlLine = $tui | Where-Object { $_ -match "^URL=" } | Select-Object -Last 1
-if ($urlLine) { $Attach = $urlLine -replace "^URL=", "" }
-elseif ($Attach -eq "") { $Attach = "http://127.0.0.1:4096" }
-
-$tuiHint = "opencode attach $Attach -s $Session"
-if ($NoTui) {
-  Write-Output "MODE: headless (khong mo cua so)"
+# Check at every safe dispatch boundary, including fallback. Never interrupt
+# an in-flight model request. Fresh/explicit Session applies only to the first
+# dispatch, so fallback follows the newly active session after rollover.
+$dispatchCount = 0
+function Sync-OpenCodeSession {
+  $oldSession = $script:Session
+  $firstDispatch = $script:dispatchCount -eq 0
+  $tuiArgs = @("-Key", $Key, "-Title", "Task $([IO.Path]::GetFileNameWithoutExtension($TaskFile))")
+  if ($Attach -ne "") { $tuiArgs += @("-Url", $Attach) }
+  if ($firstDispatch -and $initialSession) { $tuiArgs += @("-Session", $initialSession) }
+  if ($firstDispatch -and $FreshTui) { $tuiArgs += "-Fresh" }
+  if ($NoTui -or -not $firstDispatch) { $tuiArgs += "-NoWindow" }
+  $tui = & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $PSScriptRoot "oc-tui.ps1") @tuiArgs
+  $tuiCode = $LASTEXITCODE
+  $tui | ForEach-Object { Write-Host $_ }
+  $line = $tui | Where-Object { $_ -match "^SESSION=" } | Select-Object -Last 1
+  $urlLine = $tui | Where-Object { $_ -match "^URL=" } | Select-Object -Last 1
+  if ($tuiCode -ne 0 -or -not $line -or -not $urlLine) { throw "oc-tui.ps1 khong tra ve session/URL hop le (exit=$tuiCode)." }
+  $script:Session = $line -replace "^SESSION=", ""
+  $script:Attach = $urlLine -replace "^URL=", ""
+  $script:tuiHint = "opencode attach $($script:Attach) -s $($script:Session)"
+  if ($NoTui -and $firstDispatch) { Write-Host "MODE: headless (khong mo cua so)" }
+  # Print here as well for backwards-compatible helpers; host stream makes
+  # the reconnect command visible while Invoke-OpenCode's result is captured.
+  Write-Host "TUI: $($script:tuiHint)"
+  if (-not $NoTui -and -not $firstDispatch -and $oldSession -ne $script:Session) {
+    # User chose TUI: move the visible window to the replacement session too.
+    & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $PSScriptRoot "oc-tui.ps1") `
+      -Key $Key -Url $script:Attach -Session $script:Session | ForEach-Object { Write-Host $_ }
+    if ($LASTEXITCODE -ne 0) { throw "Khong mo lai duoc TUI sau rollover." }
+  }
+  $script:dispatchCount++
 }
-Write-Output "TUI: $tuiHint"
 
 $base = [IO.Path]::GetFileNameWithoutExtension($TaskFile)
 if ($Tag -eq "") { $Tag = (Get-Date -Format "HHmmss") }
@@ -231,6 +251,8 @@ function Test-QuotaOrUnavailable($logPath) {
 }
 
 function Invoke-OpenCode($modelId, $variantName, $logPath) {
+  Sync-OpenCodeSession
+  Assert-SessionRepo $Attach $Session | ForEach-Object { Write-Host $_ }
   $ocArgs = @("run", "--auto", "--model", $modelId)
   if ($variantName -ne "") { $ocArgs += @("--variant", $variantName) }
   if ($Attach  -ne "")     { $ocArgs += @("--attach", $Attach) }
@@ -238,8 +260,8 @@ function Invoke-OpenCode($modelId, $variantName, $logPath) {
   if ($Resume)             { $ocArgs += "--continue" }
 
   $label = if ($variantName -ne "") { "$modelId (variant $variantName)" } else { $modelId }
-  Write-Output "=> opencode $label | task=$base (stdin UTF-8) | log=$logPath"
-  if ($Attach -ne "") { Write-Output "   xem live: $tuiHint" }
+  Write-Host "=> opencode $label | task=$base (stdin UTF-8) | log=$logPath"
+  if ($Attach -ne "") { Write-Host "   xem live: $tuiHint" }
 
   $sw = [Diagnostics.Stopwatch]::StartNew()
   # Job tu ghi PID cua no ra file trong TEMP de cha biet duong giet ca cay khi
@@ -312,8 +334,7 @@ function Invoke-OpenCode($modelId, $variantName, $logPath) {
 }
 
 # ---------- luot chinh ----------
-# Chot chan cuoi: xac nhan lan nua phien/URL sap dung thuoc dung repo.
-if ($Attach -ne "") { Assert-SessionRepo $Attach $Session }
+# Sync-OpenCodeSession va Assert-SessionRepo chay truoc moi dispatch.
 $log = Join-Path $logDir "$base-$Tag.log"
 $r   = Invoke-OpenCode $Model $Variant $log
 $usedModels = @("$Model" + $(if ($Variant -ne "") { " ($Variant)" } else { "" }))

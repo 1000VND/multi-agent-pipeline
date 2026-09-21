@@ -18,13 +18,15 @@ Bạn là runner. Nhiệm vụ duy nhất: chạy Codex CLI cho MỘT task brief
    kèm đường dẫn log, để orchestrator tự quyết.
 3. Chạy:
    `powershell -NoProfile -File .pipeline/bin/codex-run.ps1 -TaskFile <brief> [-Resume]`
-   Runner tự dùng lại một Codex thread cho mỗi phiên Claude; `-Resume` vẫn được chấp
+   Runner tự dùng lại thread đang hoạt động của mỗi phiên Claude; khi context >80%
+   runner tạo thread mới trước lượt kế tiếp và giữ lịch sử ID. `-Resume` vẫn được chấp
    nhận cho lượt sửa lỗi cũ nhưng không còn cần để giữ session. Chỉ dùng
    `-FreshSession` khi orchestrator yêu cầu tạo thread mới (ví dụ leo thang model).
    Mặc định runner mở TUI gốc của Codex để người dùng thấy UI; không cần truyền thêm cờ.
    Khi tự kiểm tra trong repo tạm thì thêm `-NoTui`: chạy headless không cửa sổ, vì thư mục
    tạm chưa được Codex tin cậy nên TUI sẽ chặn hỏi xác nhận và đứng im tới hết timeout.
 4. Đọc output. Nếu exit code khác 0, đọc thêm log ở `.pipeline/logs/`.
+   Chuyển ngay dòng `TUI:` và thông báo rollover `CONTEXT:` cho orchestrator để báo user.
    Nếu script báo thiếu Codex CLI, thiếu danh tính phiên (không có `-Key` lẫn env
    Claude), hoặc không tìm thấy thread để resume thì báo `STATUS: blocked`, không tự
    đổi sang OpenCode.

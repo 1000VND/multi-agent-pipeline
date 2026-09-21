@@ -4,8 +4,8 @@
   Phan code cua goi (agents, skill, bin) luon duoc copy de (cap nhat).
   Du lieu cua nguoi dung (config, state, PROJECT_RULES, template, gitignore)
   chi duoc tao khi chua co; dung -Force de de va se in ro tung file bi de.
-  Rieng policy fallback OpenCode trong config cu duoc migrate nhe de cap nhat
-  model ma khong de rules/timeout/forbidden paths cua du an.
+  Policy fallback OpenCode va setting session moi duoc migrate nhe trong
+  config cu, giu rules/timeout/forbidden paths cua du an.
 #>
 param(
   [string]$Target = ".",
@@ -87,63 +87,90 @@ function Get-CompactJson {
   return ($Value | ConvertTo-Json -Depth 12 -Compress)
 }
 
-# Chi nang schema fallback OpenCode: giu nguyen project_name, test_command,
+# Nang schema fallback OpenCode va bo sung setting session con thieu:
+# giu nguyen project_name, test_command,
 # timeout, forbidden_paths, rules_docs va model Codex cua project dich.
-function Migrate-OpenCodeFallbackPolicy($dest, $templatePath) {
+function Migrate-PipelineConfig($dest, $templatePath) {
   try {
     $current = Get-Content -Raw -Encoding UTF8 $dest | ConvertFrom-Json
     $template = Get-Content -Raw -Encoding UTF8 $templatePath | ConvertFrom-Json
+    if ($current -isnot [pscustomobject]) { throw "Config must be a JSON object" }
+    if ($current.model_policy -and $current.model_policy -isnot [pscustomobject]) { throw "model_policy must be a JSON object" }
+    if ($current.model_policy.opencode -and $current.model_policy.opencode -isnot [pscustomobject]) { throw "model_policy.opencode must be a JSON object" }
+    if ($null -ne $current.session_rollover -and $current.session_rollover -isnot [pscustomobject]) { throw "session_rollover must be a JSON object" }
   } catch {
-    Write-Output "CANH BAO: khong doc duoc $dest - giu nguyen, khong migrate policy OpenCode"
+    # Khong ghi warning vao success stream: chuoi canh bao + $false se thanh
+    # mot array truthy, khien caller bao MIGRATE du file chua duoc sua.
+    Write-Warning "CANH BAO: khong doc duoc config hop le $dest - giu nguyen, khong migrate config"
     return $false
+  }
+
+  $changed = $false
+  if ($null -eq $current.session_rollover) {
+    Set-JsonProperty -Object $current -Name "session_rollover" -Value ([pscustomobject]@{})
+    $changed = $true
+  }
+  if (-not $current.session_rollover.PSObject.Properties["context_percent"]) {
+    Set-JsonProperty -Object $current.session_rollover -Name "context_percent" -Value $template.session_rollover.context_percent
+    $changed = $true
   }
 
   if (-not $current.model_policy) {
     Set-JsonProperty -Object $current -Name "model_policy" -Value ([pscustomobject]@{})
+    $changed = $true
   }
   if (-not $current.model_policy.opencode) {
     Set-JsonProperty -Object $current.model_policy -Name "opencode" -Value ([pscustomobject]@{})
+    $changed = $true
   }
   $targetPolicy = $current.model_policy.opencode
   $sourcePolicy = $template.model_policy.opencode
 
   # Neu project cu chua co primary/variant thi bo sung default; neu da tu chinh
   # hai gia tri nay thi ton trong lua chon do.
-  if (-not $targetPolicy.primary) { Set-JsonProperty -Object $targetPolicy -Name "primary" -Value $sourcePolicy.primary }
-  if (-not $targetPolicy.variant) { Set-JsonProperty -Object $targetPolicy -Name "variant" -Value $sourcePolicy.variant }
+  if (-not $targetPolicy.primary) {
+    Set-JsonProperty -Object $targetPolicy -Name "primary" -Value $sourcePolicy.primary
+    $changed = $true
+  }
+  if (-not $targetPolicy.variant) {
+    Set-JsonProperty -Object $targetPolicy -Name "variant" -Value $sourcePolicy.variant
+    $changed = $true
+  }
 
   $wantedNoChange = Get-CompactJson -Value $sourcePolicy.fallback_on_no_change
   $wantedQuota = Get-CompactJson -Value $sourcePolicy.fallback_on_quota
   $currentNoChange = if ($targetPolicy.fallback_on_no_change) { Get-CompactJson -Value $targetPolicy.fallback_on_no_change } else { "" }
   $currentQuota = if ($targetPolicy.fallback_on_quota) { Get-CompactJson -Value $targetPolicy.fallback_on_quota } else { "" }
   $hasLegacy = [bool]$targetPolicy.PSObject.Properties["fallback"]
-  $needsMigration = $hasLegacy -or ($currentNoChange -ne $wantedNoChange) -or ($currentQuota -ne $wantedQuota)
-  if (-not $needsMigration) { return $false }
+  $needsFallbackMigration = $hasLegacy -or ($currentNoChange -ne $wantedNoChange) -or ($currentQuota -ne $wantedQuota)
+  if (-not $changed -and -not $needsFallbackMigration) { return $false }
 
-  # Tao lai tung entry, de PowerShell 5.1 giu dung JSON array thay vi boc ca
-  # mang vao mot object { value, Count }.
-  $newNoChange = [System.Collections.Generic.List[object]]::new()
-  foreach ($entry in @($sourcePolicy.fallback_on_no_change)) {
-    $newNoChange.Add([pscustomobject]@{
-      model = [string]$entry.model
-      variant = if ($null -eq $entry.variant) { $null } else { [string]$entry.variant }
-    })
+  if ($needsFallbackMigration) {
+    # Tao lai tung entry, de PowerShell 5.1 giu dung JSON array thay vi boc ca
+    # mang vao mot object { value, Count }.
+    $newNoChange = [System.Collections.Generic.List[object]]::new()
+    foreach ($entry in @($sourcePolicy.fallback_on_no_change)) {
+      $newNoChange.Add([pscustomobject]@{
+        model = [string]$entry.model
+        variant = if ($null -eq $entry.variant) { $null } else { [string]$entry.variant }
+      })
+    }
+    $newQuota = [System.Collections.Generic.List[object]]::new()
+    foreach ($entry in @($sourcePolicy.fallback_on_quota)) {
+      $newQuota.Add([pscustomobject]@{
+        model = [string]$entry.model
+        variant = if ($null -eq $entry.variant) { $null } else { [string]$entry.variant }
+      })
+    }
+    # Xoa property cu roi Add-Member lai: PS 5.1 co the serialise sai mang khi
+    # gan truc tiep vao PSProperty.Value cua config ConvertFrom-Json.
+    [void]$targetPolicy.PSObject.Properties.Remove("fallback_on_no_change")
+    [void]$targetPolicy.PSObject.Properties.Remove("fallback_on_quota")
+    $targetPolicy | Add-Member -NotePropertyName "fallback_on_no_change" -NotePropertyValue $newNoChange
+    $targetPolicy | Add-Member -NotePropertyName "fallback_on_quota" -NotePropertyValue $newQuota
+    if ($hasLegacy) { [void]$targetPolicy.PSObject.Properties.Remove("fallback") }
   }
-  $newQuota = [System.Collections.Generic.List[object]]::new()
-  foreach ($entry in @($sourcePolicy.fallback_on_quota)) {
-    $newQuota.Add([pscustomobject]@{
-      model = [string]$entry.model
-      variant = if ($null -eq $entry.variant) { $null } else { [string]$entry.variant }
-    })
-  }
-  # Xoa property cu roi Add-Member lai: PS 5.1 co the serialise sai mang khi
-  # gan truc tiep vao PSProperty.Value cua config ConvertFrom-Json.
-  [void]$targetPolicy.PSObject.Properties.Remove("fallback_on_no_change")
-  [void]$targetPolicy.PSObject.Properties.Remove("fallback_on_quota")
-  $targetPolicy | Add-Member -NotePropertyName "fallback_on_no_change" -NotePropertyValue $newNoChange
-  $targetPolicy | Add-Member -NotePropertyName "fallback_on_quota" -NotePropertyValue $newQuota
-  if ($hasLegacy) { [void]$targetPolicy.PSObject.Properties.Remove("fallback") }
-  $current | ConvertTo-Json -Depth 12 | Set-Content -Path $dest -Encoding UTF8
+  $current | ConvertTo-Json -Depth 100 | Set-Content -Path $dest -Encoding UTF8
   return $true
 }
 
@@ -157,8 +184,8 @@ $dataFiles = @(
 foreach ($f in $dataFiles) {
   $dest = Join-Path $targetPath $f.Dst
   if ((Test-Path $dest) -and (-not $Force)) {
-    if ($f.IsConfig -and (Migrate-OpenCodeFallbackPolicy $dest $f.Src)) {
-      Write-Output "MIGRATE: $($f.Dst) (cap nhat policy fallback OpenCode, giu config du an)"
+    if ($f.IsConfig -and (Migrate-PipelineConfig $dest $f.Src)) {
+      Write-Output "MIGRATE: $($f.Dst) (cap nhat policy fallback OpenCode/session, giu config du an)"
       continue
     }
     Write-Output "GIU NGUYEN: $($f.Dst) (da co, dung -Force neu muon de)"

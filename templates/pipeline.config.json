@@ -5,6 +5,7 @@
   "timeout_sec": 1200,
   "forbidden_paths": [".env", "config/", "cache/", "logs/", "state/"],
   "rules_docs": [],
+  "session_rollover": { "context_percent": 80 },
   "model_policy": {
     "opencode": {
       "primary": "opencode-go/deepseek-v4.1-flash",

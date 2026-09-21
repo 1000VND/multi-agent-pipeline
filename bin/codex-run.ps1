@@ -2,9 +2,9 @@
   codex-run.ps1 - Chay Codex CLI cho 1 task brief, ghi JSONL day du ra file,
   chi tra ve summary ngan cho Claude doc.
 
-  Moi phien Claude gan voi dung mot Codex thread. Cac lan giao task sau tu
+  Moi phien Claude gan voi mot Codex thread dang hoat dong. Cac lan giao task sau tu
   dong resume thread do; TUI cu duoc dong truoc khi mo lai de khong tich
-  nhieu cua so. -FreshSession chi dung khi can tach sang thread Codex moi.
+  nhieu cua so. Context >80% tu tach thread truoc task ke tiep; lich su ID duoc giu.
 #>
 param(
   [Parameter(Mandatory = $true)][string]$TaskFile,
@@ -49,11 +49,13 @@ if ($TimeoutSec -le 0) { $TimeoutSec = 1200 }
 $testCommand = ""
 if ($pipelineConfig) { $testCommand = [string]$pipelineConfig.test_command }
 $contextRolloverPercent = 80
-if ($pipelineConfig -and $pipelineConfig.session_rollover.context_percent) {
-  $contextRolloverPercent = [int]$pipelineConfig.session_rollover.context_percent
+if ($pipelineConfig -and $null -ne $pipelineConfig.session_rollover.context_percent) {
+  $configuredPercent = 0
+  if ([int]::TryParse([string]$pipelineConfig.session_rollover.context_percent, [ref]$configuredPercent) -and
+      $configuredPercent -ge 1 -and $configuredPercent -le 99) {
+    $contextRolloverPercent = $configuredPercent
+  }
 }
-# Ngưỡng 100% không còn chỗ cho prompt kế tiếp; 1% cũng khiến mọi lượt bị tách.
-if ($contextRolloverPercent -lt 1 -or $contextRolloverPercent -gt 99) { $contextRolloverPercent = 80 }
 
 # Model bi cam dung de implement code (co the ghi de trong pipeline.config.json).
 $forbiddenModels = @("gpt-5.6-sol", "gpt-6-astra")
@@ -228,65 +230,108 @@ if ($dirty -and -not $Resume) {
 # -Key la duong ghi de cho nguoi goi ngoai Claude Code. Khong co ca ba nguon thi
 # khong the gan Codex thread vao dung phien; dung chung mot khoa se tron lich su
 # cua nhieu lan chay khac nhau nen phai tu choi chay.
-if ($Key -eq "") { $Key = $env:CLAUDE_CODE_HOST_SESSION_ID }
-if (-not $Key) { $Key = $env:CLAUDE_CODE_SESSION_ID }
-if (-not $Key) {
+if ([string]::IsNullOrWhiteSpace($Key)) { $Key = $env:CLAUDE_CODE_HOST_SESSION_ID }
+if ([string]::IsNullOrWhiteSpace($Key)) { $Key = $env:CLAUDE_CODE_SESSION_ID }
+if ([string]::IsNullOrWhiteSpace($Key)) {
   Write-Output "BLOCKED: khong xac dinh duoc phien Claude (CLAUDE_CODE_HOST_SESSION_ID/CLAUDE_CODE_SESSION_ID deu trong). Chay ngoai Claude Code thi truyen -Key <ten-phien> de khong tron lich su Codex."
   exit 11
 }
 $mapKey = $Key
 $tuiMapKey = "__pipeline_tui__" # ban ghi toan repo trong codex-map.json da duoc ignore
 
-function Read-Json($path) {
-  if (-not (Test-Path $path)) { return $null }
-  try { return (Get-Content -Raw -Encoding UTF8 $path | ConvertFrom-Json) } catch { return $null }
-}
-
 function Read-MapTable {
-  $map = Read-Json $mapFile
   $table = @{}
-  if ($map) { $map.PSObject.Properties | ForEach-Object { $table[$_.Name] = $_.Value } }
+  if (Test-Path -LiteralPath $mapFile) {
+    try {
+      $map = Get-Content -Raw -Encoding UTF8 -LiteralPath $mapFile | ConvertFrom-Json -ErrorAction Stop
+      if ($map -isnot [pscustomobject]) { throw "Map must be a JSON object" }
+      $map.PSObject.Properties | ForEach-Object { $table[$_.Name] = $_.Value }
+    } catch {
+      throw "BLOCKED: khong doc duoc $mapFile; giu nguyen de tranh mat lich su session. $($_.Exception.Message)"
+    }
+  }
   return $table
 }
 
+function Write-MapTable($table) {
+  # Ghi atomic duoi run lock: neu bi dung giua luc ghi thi map cu van doc duoc.
+  $tempMap = Join-Path $logDir ("codex-map-" + [guid]::NewGuid().ToString("N") + ".tmp")
+  try {
+    $json = ConvertTo-Json -InputObject $table -Depth 12
+    [IO.File]::WriteAllText($tempMap, $json, [Text.UTF8Encoding]::new($false))
+    if (Test-Path -LiteralPath $mapFile) { [IO.File]::Replace($tempMap, $mapFile, [NullString]::Value) }
+    else { [IO.File]::Move($tempMap, $mapFile) }
+  } finally {
+    if (Test-Path -LiteralPath $tempMap) { Remove-Item -LiteralPath $tempMap -Force }
+  }
+}
+
 function Set-ObjectProperty($object, $name, $value) {
+  if ($object -is [System.Collections.IDictionary]) { $object[$name] = $value; return }
   $prop = $object.PSObject.Properties[$name]
   if ($prop) { $prop.Value = $value } else { $object | Add-Member -NotePropertyName $name -NotePropertyValue $value }
 }
 
-function Get-CodexSessionHistory($existing) {
+function Get-CodexSessionHistory($table) {
   $history = [System.Collections.Generic.List[object]]::new()
-  if ($existing) {
+  $seen = @{}
+  $records = @()
+  if ($table.ContainsKey($mapKey)) { $records += $table[$mapKey] }
+  # Gom tat ca map <Claude>::<task> doi cu, khong chi thread moi nhat.
+  $records += @($table.GetEnumerator() |
+    Where-Object { $_.Name -ne $mapKey -and $_.Name -ne $tuiMapKey -and $_.Value.session_key -eq $Key } |
+    Sort-Object { $_.Value.last_used } | ForEach-Object { $_.Value })
+  foreach ($existing in $records) {
     foreach ($entry in @($existing.codex_sessions)) {
-      if ($entry -and $entry.thread_id) { $history.Add($entry) }
+      if ($entry -and $entry.thread_id -and -not $seen.ContainsKey([string]$entry.thread_id)) {
+        $history.Add($entry)
+        $seen[[string]$entry.thread_id] = $true
+      }
     }
-    # Map đời cũ chỉ có codex_thread. Đưa nó vào lịch sử trước khi ghi đè.
-    if ($existing.codex_thread -and -not (@($history | Where-Object { $_.thread_id -eq $existing.codex_thread }).Count)) {
+    if ($existing.codex_thread -and -not $seen.ContainsKey([string]$existing.codex_thread)) {
       $history.Add([pscustomobject]@{
         thread_id = [string]$existing.codex_thread
-        created_at = if ($existing.last_used) { [string]$existing.last_used } else { (Get-Date).ToString("s") }
+        created_at = $null # Thoi diem tao session cu khong duoc map doi cu luu.
         last_used = if ($existing.last_used) { [string]$existing.last_used } else { (Get-Date).ToString("s") }
+        created_reason = "legacy_map"
+        resume_command = "codex resume $($existing.codex_thread)"
       })
+      $seen[[string]$existing.codex_thread] = $true
     }
   }
   return ,$history
 }
 
+$script:nextSessionReason = "initial"
 function Save-Session($threadId, $tuiPid = $null) {
   if (-not $threadId) { return }
   $table = Read-MapTable
   $previous = if ($table.ContainsKey($mapKey)) { $table[$mapKey] } else { $null }
-  $history = Get-CodexSessionHistory $previous
+  $history = Get-CodexSessionHistory $table
   $now = (Get-Date).ToString("s")
+  if ($previous.codex_thread -and $previous.codex_thread -ne $threadId) {
+    $old = $history | Where-Object { $_.thread_id -eq $previous.codex_thread } | Select-Object -First 1
+    Set-ObjectProperty $old "retired_at" $now
+    if (-not $old.retired_reason) { Set-ObjectProperty $old "retired_reason" $script:nextSessionReason }
+  }
   $entry = @($history | Where-Object { $_.thread_id -eq $threadId } | Select-Object -First 1)
   if ($entry.Count -eq 0) {
-    $history.Add([pscustomobject]@{ thread_id = $threadId; created_at = $now; last_used = $now })
+    $entry = @([pscustomobject]@{
+      thread_id = $threadId; created_at = $now; last_used = $now
+      created_reason = $script:nextSessionReason
+      previous_thread_id = if ($previous.codex_thread -ne $threadId) { $previous.codex_thread } else { $null }
+      resume_command = "codex resume $threadId"
+    })
+    $history.Add($entry[0])
   } else {
     Set-ObjectProperty $entry[0] "last_used" $now
   }
+  Set-ObjectProperty $entry[0] "last_task_id" $TaskId
+  Set-ObjectProperty $entry[0] "resume_command" "codex resume $threadId"
   $record = @{
     codex_thread = $threadId
-    claude_session_id = $env:CLAUDE_CODE_SESSION_ID
+    claude_session_id = if ($env:CLAUDE_CODE_SESSION_ID) { $env:CLAUDE_CODE_SESSION_ID } else { $previous.claude_session_id }
+    claude_host_session_id = if ($env:CLAUDE_CODE_HOST_SESSION_ID) { $env:CLAUDE_CODE_HOST_SESSION_ID } else { $previous.claude_host_session_id }
     session_key = $Key
     last_task_id = $TaskId
     last_used = $now
@@ -294,14 +339,14 @@ function Save-Session($threadId, $tuiPid = $null) {
   }
   if ($tuiPid) { $record.tui_pid = [int]$tuiPid }
   $table[$mapKey] = $record
-  $table | ConvertTo-Json -Depth 5 | Set-Content -Path $mapFile -Encoding UTF8
+  Write-MapTable $table
 }
 
 function Retire-CodexSession($threadId, $context) {
   $table = Read-MapTable
   if (-not $table.ContainsKey($mapKey)) { return }
   $previous = $table[$mapKey]
-  $history = Get-CodexSessionHistory $previous
+  $history = Get-CodexSessionHistory $table
   $entry = @($history | Where-Object { $_.thread_id -eq $threadId } | Select-Object -First 1)
   if ($entry.Count -eq 0) {
     $entry = @([pscustomobject]@{ thread_id = $threadId; created_at = (Get-Date).ToString("s") })
@@ -314,7 +359,7 @@ function Retire-CodexSession($threadId, $context) {
   Set-ObjectProperty $entry[0] "context_window_tokens" ([int64]$context.context_window)
   Set-ObjectProperty $previous "codex_sessions" $history
   $table[$mapKey] = $previous
-  $table | ConvertTo-Json -Depth 6 | Set-Content -Path $mapFile -Encoding UTF8
+  Write-MapTable $table
 }
 
 # Thoi diem khoi dong tien trinh (UTC, round-trip) de phan biet PID bi tai su
@@ -356,7 +401,7 @@ function Close-ManagedTui {
     }
   }
   $table.Remove($tuiMapKey)
-  $table | ConvertTo-Json -Depth 5 | Set-Content -Path $mapFile -Encoding UTF8
+  Write-MapTable $table
 }
 
 function Save-ManagedTui($tuiProcessId) {
@@ -368,7 +413,7 @@ function Save-ManagedTui($tuiProcessId) {
     if ($procStart) { $record.proc_started = $procStart }
   }
   $table[$tuiMapKey] = $record
-  $table | ConvertTo-Json -Depth 5 | Set-Content -Path $mapFile -Encoding UTF8
+  Write-MapTable $table
 }
 
 # Ban do cu dung khoa "<phien Claude>::<task>". Doc no mot lan de cac phien
@@ -420,11 +465,15 @@ function Get-FileChangeCount($logPath) {
 }
 
 function Get-NativeThreadId($logPath) {
-  $event = Get-EventValues $logPath |
-    Where-Object { $_.type -eq "session_meta" -and $_.payload.session_id } |
-    Select-Object -First 1
-  if ($event) { return [string]$event.payload.session_id }
+  $event = Get-FirstJsonLine $logPath
+  if ($event -and $event.type -eq "session_meta") { return (Get-RolloutThreadId $event.payload) }
   return $null
+}
+
+function Get-RolloutThreadId($meta) {
+  # Desktop/subagent co the dung session_id cua cha; id moi la thread cua file.
+  if ($meta.id) { return [string]$meta.id }
+  return [string]$meta.session_id
 }
 
 function Get-FirstJsonLine($path) {
@@ -438,7 +487,7 @@ function Get-FirstJsonLine($path) {
 # Tim rollout cua dung phien: moi nhat, sinh sau $since, va session_meta.cwd
 # dung bang repo. Khong duoc bo dieu kien cwd: nguoi dung co the dang chay
 # mot phien Codex khac cung luc.
-function Find-Rollout($rootDir, $since, $expectedCwd) {
+function Find-Rollout($rootDir, $since, $expectedCwd, $expectedThread = "") {
   if (-not (Test-Path $rootDir)) { return $null }
   $files = Get-ChildItem -Path $rootDir -Recurse -Filter *.jsonl -ErrorAction SilentlyContinue |
     Where-Object { $_.LastWriteTime -gt $since } |
@@ -447,7 +496,17 @@ function Find-Rollout($rootDir, $since, $expectedCwd) {
     $meta = Get-FirstJsonLine $file.FullName
     if ($meta -and $meta.type -eq "session_meta" -and $meta.payload.cwd) {
       $cwd = ([string]$meta.payload.cwd).Replace('/', '\').TrimEnd('\')
-      if ($cwd -ieq $expectedCwd) { return $file }
+      if ($cwd -ine $expectedCwd) { continue }
+      if ($expectedThread -and (Get-RolloutThreadId $meta.payload) -ne $expectedThread) { continue }
+      if ($meta.payload.parent_thread_id -or $meta.payload.source.subagent) { continue }
+      if (-not $expectedThread) {
+        # Luot tao moi khong duoc bat rollout cu vua duoc TUI khac ghi them.
+        $created = [datetimeoffset]::MinValue
+        if ($meta.payload.timestamp -and [datetimeoffset]::TryParse([string]$meta.payload.timestamp, [ref]$created)) {
+          if ($created.UtcDateTime -lt $since.ToUniversalTime()) { continue }
+        } elseif ($file.CreationTime -lt $since) { continue }
+      }
+      return $file
     }
   }
   return $null
@@ -466,11 +525,15 @@ function Write-LogTail($logPath) {
   }
 }
 
+# Kiem tra map ngay ca khi -FreshSession: map hong phai chan truoc khi spawn,
+# neu khong thread moi co the duoc tao nhung khong luu duoc ID vao lich su.
+[void](Read-MapTable)
 if ($FreshSession) {
   # Fresh co uu tien hon -Resume/-Session: day la loi thoat co chu dich cho
   # escalation, khong duoc vo tinh quay lai chuoi suy luan cu.
   $Session = ""
   $Resume = $false
+  $script:nextSessionReason = "fresh_session"
 }
 
 function Get-CodexHomePath {
@@ -481,33 +544,63 @@ function Get-CodexHomePath {
   return (Join-Path $profilePath ".codex")
 }
 
-# Token usage cua Codex la usage cua request gan nhat, khong phai tong lifetime
-# cua thread. So sanh input_tokens voi model_context_window de quyet dinh co
-# con an toan resume cho task moi hay khong.
+function Get-RequestContextTokens($usage) {
+  if (-not $usage) { return $null }
+  $value = 0L
+  if ($null -ne $usage.total_tokens -and [int64]::TryParse([string]$usage.total_tokens, [ref]$value) -and $value -ge 0) { return $value }
+  $inputCount = 0L
+  if ($null -eq $usage.input_tokens -or -not [int64]::TryParse([string]$usage.input_tokens, [ref]$inputCount) -or $inputCount -lt 0) { return $null }
+  $outputCount = 0L
+  if ($null -ne $usage.output_tokens -and -not [int64]::TryParse([string]$usage.output_tokens, [ref]$outputCount)) { return $null }
+  if ($outputCount -lt 0) { return $null }
+  # cached_input_tokens va reasoning_output_tokens da nam trong input/output.
+  return ($inputCount + $outputCount)
+}
+
+# Doc usage cua request gan nhat tu rollout dung thread va repo. Tong token
+# lifetime/turn la chi phi tich luy, khong phai context hien tai.
 function Get-CodexSessionContext($threadId) {
   $sessionsRoot = Join-Path (Get-CodexHomePath) "sessions"
   if (-not (Test-Path $sessionsRoot)) { return $null }
   $files = Get-ChildItem -Path $sessionsRoot -Recurse -Filter *.jsonl -ErrorAction SilentlyContinue |
     Sort-Object LastWriteTime -Descending
+  # UUID nam trong ten rollout thong thuong; fallback metadata cho file doi cu.
+  $namedFiles = @($files | Where-Object { $_.Name.Contains($threadId) })
+  if ($namedFiles.Count -gt 0) { $files = $namedFiles }
   foreach ($file in $files) {
     $meta = Get-FirstJsonLine $file.FullName
-    if (-not $meta -or $meta.type -ne "session_meta" -or $meta.payload.session_id -ne $threadId) { continue }
+    if (-not $meta -or $meta.type -ne "session_meta" -or (Get-RolloutThreadId $meta.payload) -ne $threadId) { continue }
+    if (([string]$meta.payload.cwd).Replace('/', '\').TrimEnd('\') -ine $repo.Replace('/', '\').TrimEnd('\')) { continue }
     $window = 0L
-    $used = 0L
-    Get-Content -Path $file.FullName -Encoding UTF8 -ErrorAction SilentlyContinue | ForEach-Object {
-      try {
-        $event = $_ | ConvertFrom-Json
-        if ($event.type -eq "event_msg" -and $event.payload.type -eq "task_started" -and $event.payload.model_context_window) {
-          $window = [int64]$event.payload.model_context_window
+    $used = $null
+    try {
+      foreach ($line in [IO.File]::ReadLines($file.FullName, [Text.Encoding]::UTF8)) {
+        try { $event = $line | ConvertFrom-Json -ErrorAction Stop } catch { continue }
+        $payload = $event.payload
+        if ($event.type -eq "compacted" -or ($event.type -eq "event_msg" -and $payload.type -eq "context_compacted")) {
+          # Chua co usage sau compact -> khong reuse con so cu de rollover nham.
+          $used = $null
+          continue
         }
-        if ($event.type -eq "token_usage_record" -and $event.payload.usage.input_tokens) {
-          $used = [int64]$event.payload.usage.input_tokens
+        if ($event.type -eq "event_msg" -and $payload.type -eq "task_started") {
+          $candidateWindow = 0L
+          if ([int64]::TryParse([string]$payload.model_context_window, [ref]$candidateWindow) -and $candidateWindow -gt 0) { $window = $candidateWindow }
         }
-      } catch { }
+        if ($event.type -eq "token_usage_record") {
+          if ($payload.thread_id -and $payload.thread_id -ne $threadId) { continue }
+          $used = Get-RequestContextTokens $payload.usage
+        }
+        if ($event.type -eq "event_msg" -and $payload.type -eq "token_count" -and $payload.info) {
+          $candidateWindow = 0L
+          if ([int64]::TryParse([string]$payload.info.model_context_window, [ref]$candidateWindow) -and $candidateWindow -gt 0) { $window = $candidateWindow }
+          $used = Get-RequestContextTokens $payload.info.last_token_usage
+        }
+      }
+    } catch { return $null }
+    if ($window -gt 0 -and $null -ne $used) {
+      return @{ used_tokens = $used; context_window = $window; percent = [math]::Round((100.0 * $used / $window), 2) }
     }
-    if ($window -gt 0 -and $used -gt 0) {
-      return @{ used_tokens = $used; context_window = $window; percent = [math]::Round((100.0 * $used / $window), 1) }
-    }
+    return $null # File moi nhat cua thread la nguon dung, khong quay lai ban cu.
   }
   return $null
 }
@@ -515,13 +608,22 @@ if ((-not $FreshSession) -and $Session -eq "") {
   $Session = Get-MappedSession
 }
 if ((-not $FreshSession) -and $Session) {
+  # Ghi lien ket truoc khi thu tao phien moi: ca -Session va legacy map deu
+  # duoc giu lai neu CLI loi truoc khi tra thread.started.
+  $script:nextSessionReason = "selected_session"
+  Save-Session $Session
   $context = Get-CodexSessionContext $Session
-  if ($context -and $context.percent -ge $contextRolloverPercent) {
+  if ($context -and ([decimal]$context.used_tokens * 100 -gt [decimal]$context.context_window * $contextRolloverPercent)) {
     Write-Output "CONTEXT: Codex thread $Session dang $($context.percent)% ($($context.used_tokens)/$($context.context_window) tokens) - tao phien moi"
     Retire-CodexSession $Session $context
+    $script:nextSessionReason = "context_over_$contextRolloverPercent%"
     $Session = ""
     $Resume = $false
     $FreshSession = $true
+  } elseif ($context) {
+    Write-Output "CONTEXT: Codex thread $Session dang $($context.percent)% ($($context.used_tokens)/$($context.context_window) tokens) - dung lai"
+  } else {
+    Write-Output "CONTEXT: khong doc duoc usage/context window cua Codex thread $Session - giu phien hien tai"
   }
 }
 if ($Resume -and -not $Session) {
@@ -535,6 +637,72 @@ if ($Session -and -not $FreshSession) { $Resume = $true }
 
 function Write-TuiResumeHint($threadId) {
   if ($threadId) { Write-Output "TUI: codex resume $threadId" }
+}
+
+function Start-CodexExec($exe, $arguments, $cwd, $inputPath, $outputPath, $errorPath) {
+  # Tu so huu Process ngay tu Start: Start-Process tren PS 5.1 co the mat
+  # handle/ExitCode neu CLI thoat truoc khi cmdlet tra ve. Pump byte bat dong
+  # bo de brief dai va stdout/stderr khong chan vong lap timeout.
+  if (-not ("Pipeline.ExecProcess" -as [type])) {
+    Add-Type -TypeDefinition @'
+using System;
+using System.Diagnostics;
+using System.IO;
+using System.Threading.Tasks;
+namespace Pipeline {
+  public sealed class ExecProcess : IDisposable {
+    public Process Process { get; private set; }
+    private Stream input, output, error;
+    private Task inputTask, outputTask, errorTask;
+    private static async Task Pump(Stream source, Stream destination, bool closeDestination) {
+      try {
+        byte[] buffer = new byte[4096];
+        int count;
+        while ((count = await source.ReadAsync(buffer, 0, buffer.Length).ConfigureAwait(false)) > 0) {
+          await destination.WriteAsync(buffer, 0, count).ConfigureAwait(false);
+          await destination.FlushAsync().ConfigureAwait(false);
+        }
+      } finally {
+        if (closeDestination) destination.Dispose();
+      }
+    }
+    public ExecProcess(string exe, string arguments, string cwd, string inputPath, string outputPath, string errorPath) {
+      try {
+        input = File.OpenRead(inputPath);
+        output = new FileStream(outputPath, FileMode.Create, FileAccess.Write, FileShare.ReadWrite);
+        error = new FileStream(errorPath, FileMode.Create, FileAccess.Write, FileShare.ReadWrite);
+        Process = new Process();
+        Process.StartInfo = new ProcessStartInfo(exe, arguments) {
+          WorkingDirectory = cwd, UseShellExecute = false, CreateNoWindow = true,
+          RedirectStandardInput = true, RedirectStandardOutput = true, RedirectStandardError = true
+        };
+        Process.Start();
+        outputTask = Pump(Process.StandardOutput.BaseStream, output, false);
+        errorTask = Pump(Process.StandardError.BaseStream, error, false);
+        inputTask = Pump(input, Process.StandardInput.BaseStream, true);
+      } catch { Dispose(); throw; }
+    }
+    public int Complete() {
+      Process.WaitForExit();
+      if (!Task.WaitAll(new Task[] { outputTask, errorTask }, 5000))
+        throw new IOException("Codex exited but output pipes did not close within 5 seconds.");
+      output.Dispose();
+      error.Dispose();
+      // CLI may intentionally exit without consuming the entire brief (broken pipe).
+      if (inputTask.IsFaulted) { var observed = inputTask.Exception; }
+      return Process.ExitCode;
+    }
+    public void Dispose() {
+      if (input != null) input.Dispose();
+      if (output != null) output.Dispose();
+      if (error != null) error.Dispose();
+      if (Process != null) Process.Dispose();
+    }
+  }
+}
+'@
+  }
+  return [Pipeline.ExecProcess]::new($exe, $arguments, $cwd, $inputPath, $outputPath, $errorPath)
 }
 
 $head = & git rev-parse HEAD
@@ -601,10 +769,10 @@ if ($useTui) {
 
   while (-not $taskComplete) {
     if (-not $rollout) {
-      $rollout = Find-Rollout $sessionsRoot $t0 $repoNorm
+      $rollout = Find-Rollout $sessionsRoot $t0 $repoNorm $Session
       if ($rollout) {
         $threadId = Get-NativeThreadId $rollout.FullName
-        if ($threadId) { Save-Session $threadId $tuiProc.Id }
+        if ($threadId) { Save-Session $threadId $tuiProc.Id; Write-TuiResumeHint $threadId }
       } elseif ((-not $warnedNoRollout) -and ($sw.Elapsed.TotalSeconds -ge 90)) {
         Write-Output "CHUA THAY PHIEN CODEX NAO - cua so TUI co the dang hoi xac nhan tin cay thu muc, hay bam Yes trong cua so do"
         $warnedNoRollout = $true
@@ -713,16 +881,8 @@ if ($useTui) {
 
   $sw = [Diagnostics.Stopwatch]::StartNew()
   $errLog = "$log.err"
-  # Start-Process cho PID that va redirect thang ra file, khong can StreamWriter.
-  # Brief di vao stdin dang byte goc nen khong con rui ro encoding.
-  $proc = Start-Process -FilePath $codexExe -ArgumentList $codexArgsQuoted -PassThru -NoNewWindow `
-    -WorkingDirectory $repo `
-    -RedirectStandardInput $taskPath `
-    -RedirectStandardOutput $log `
-    -RedirectStandardError $errLog
-
-  # PS 5.1 chi doc duoc $proc.ExitCode neu handle duoc giu truoc khi tien trinh thoat.
-  [void]$proc.Handle
+  $execProcess = Start-CodexExec $codexExe ($codexArgsQuoted -join ' ') $repo $taskPath $log $errLog
+  $proc = $execProcess.Process
 
   # Cho codex xong; luu thread ngay khi thay thread.started de -Resume dung duoc
   # ke ca khi luot nay bi giet giua chung.
@@ -730,7 +890,7 @@ if ($useTui) {
   while (-not $proc.HasExited) {
     if (-not $saved) {
       $t = Get-ThreadId $log
-      if ($t) { Save-Session $t; $saved = $true }
+      if ($t) { Save-Session $t; Write-TuiResumeHint $t; $saved = $true }
     }
     if ($sw.Elapsed.TotalSeconds -ge $TimeoutSec) {
       # Stop-Process khong du: codex de tien trinh con, phai giet ca cay.
@@ -755,7 +915,7 @@ if ($useTui) {
     Start-Sleep -Seconds 1
   }
 
-  $code = $proc.ExitCode
+  $code = $execProcess.Complete()
   # Khong doc duoc exit code (vd proc khong tra ve gi) -> coi nhu -1; Codex co the thoat ma am.
   $codeNumber = 0
   if (-not [int]::TryParse(([string]$code), [ref]$codeNumber)) { $codeNumber = -1 }
@@ -864,6 +1024,7 @@ if (-not $didWork) { exit 5 }
 exit 0
 
 } finally {
+  if ($execProcess) { $execProcess.Dispose() }
   # Moi duong thoat (exit thuong, exit loi, timeout) deu phai tra run lock.
   if ($script:runLockAcquired) { Release-RunLock }
 }
