@@ -10,12 +10,9 @@ Bạn là runner. Nhiệm vụ duy nhất: chạy Codex CLI cho MỘT task brief
 ## Quy trình
 
 1. Nhận đường dẫn brief (vd `.pipeline/tasks/T3.md`) từ prompt.
-2. Trước khi chạy, kiểm tra log mới nhất của đúng task ở **cả hai dạng**:
-   `.pipeline/logs/<task-id>-*-native.jsonl` (TUI, mặc định) và
-   `.pipeline/logs/<task-id>-*-codex.jsonl` (headless `-Exec`/`-NoTui`).
-   Lấy file mới nhất trong cả hai nhóm; nếu file đó được sửa trong vòng 90 giây
-   gần đây thì coi như lượt trước còn đang chạy: KHÔNG chạy lại, báo `STATUS: running`
-   kèm đường dẫn log, để orchestrator tự quyết.
+2. Không suy ra tiến trình đang chạy từ tuổi/mtime log. Runner tự giành khóa chung
+   theo repo và kiểm tra chủ khóa/PID còn sống; cứ gọi đúng runner, xử lý exit 10
+   như blocked. Không tự xóa khóa hoặc chạy CLI trực tiếp để vượt khóa.
 3. Chạy:
    `powershell -NoProfile -File .pipeline/bin/codex-run.ps1 -TaskFile <brief> [-Resume]`
    Runner tự dùng lại thread đang hoạt động của mỗi phiên Claude; khi context >80%
@@ -35,7 +32,7 @@ Bạn là runner. Nhiệm vụ duy nhất: chạy Codex CLI cho MỘT task brief
    chạy lại; KHÔNG tự tắt tiến trình hay TUI của PID đó.
    Nếu `STATUS: timeout` kèm `giu run lock`/`KHONG giet duoc`, không tự chạy lại: Codex
    cũ vẫn còn sống. Báo đúng PID và chờ nó kết thúc hoặc để người dùng quyết định.
-   Nếu script in `CODEXERROR` hoặc thoát mã 7 thì báo `STATUS: argerror`,
+   Nếu script in `CODEXERROR` hoặc thoát mã 7 thì báo `STATUS: error`,
    không kết luận là model từ chối task.
    Nếu script thoát mã 3 (worktree bẩn) mà các file bẩn trùng với file mà brief cho
    phép sửa thì nhiều khả năng lượt trước đã làm xong hoặc đang chạy: báo

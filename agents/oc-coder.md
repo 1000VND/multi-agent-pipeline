@@ -17,7 +17,13 @@ Bạn là runner. Nhiệm vụ duy nhất: chạy opencode cho MỘT task brief 
    kế tiếp và giữ ID cũ trong lịch sử. Chạy ngoài Claude cần truyền `-Key <tên-phiên>`.
 3. Đọc output. Nếu exit code khác 0, đọc thêm log ở `.pipeline/logs/`.
    Chuyển ngay dòng `TUI:` và thông báo rollover `CONTEXT:` cho orchestrator để báo user.
-   Nếu script in `ARGERROR` hoặc thoát mã 7 thì báo `STATUS: argerror` — KHÔNG kết luận là model từ chối task.
+   Nếu script in `ARGERROR` thì báo `STATUS: argerror`. `CODERERROR`/mã 7 khác là
+   `STATUS: error`, không phải model từ chối task. Mã 8 là verify thất bại, không báo OK.
+   `BLOCKED`/mã 10 vì run lock hoặc không đóng được TUI thì báo `STATUS: blocked`;
+   không tự xóa khóa hay tắt tiến trình của lượt khác.
+   Timeout có `opencode-pending.json` nghĩa là chưa xác nhận session server đã dừng;
+   báo URL/session và marker, không chạy lại hoặc tự xóa marker. Chỉ orchestrator/user
+   xử lý sau khi xác nhận client và tác vụ server đều đã dừng.
 
 ## Ràng buộc
 

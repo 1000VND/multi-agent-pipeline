@@ -63,12 +63,13 @@ Thang leo bậc khi review fail:
 2. Review fail thì **chẩn đoán trước khi leo**: nếu fix brief chỉ ra được đúng `file:dòng`,
    sai gì, kỳ vọng gì → lỗi cơ học, giữ nguyên model và `-Resume`. Nếu không nói chính xác
    được sai ở đâu → lỗi nằm ở brief, viết lại brief, vẫn giữ nguyên model.
-3. Fail lần hai **dù brief đã chính xác** → mới leo sang bậc escalated.
-4. `attempts >= 3` → dừng, báo user (giữ nguyên luật cũ).
+3. Fail lần hai **dù brief đã chính xác** → lane Codex mới được đề xuất bậc escalated. OpenCode không có bậc escalated tương đương; giữ policy fallback đã duyệt hoặc hỏi user đổi kế hoạch.
+4. Tối đa **3 lần dispatch runner cho một task**, tính cả lượt đầu. Trước mỗi dispatch, kiểm tra `attempts < 3`, tăng `attempts` và lưu state. Fallback model bên trong một lượt OpenCode không tăng bộ đếm này.
 
-Khi leo bậc bắt buộc chạy **thread mới với `-FreshSession`**, và worktree phải sạch trước khi
-đổi model — thread cũ mang theo chuỗi suy luận hỏng, còn worktree đang chứa sửa dở của model
-trước; thả model mới đè lên thì không biết ai làm phần nào.
+Khi Codex leo bậc, dùng thread mới với `-FreshSession`. OpenCode chỉ dùng `-FreshTui`
+khi cần phiên mới; không truyền `-FreshSession` cho OpenCode. Trước khi đổi model/backend,
+review phần sửa dở và hỏi user cách xử lý để có worktree sạch; không tự xóa, stash hay
+commit phần sửa lỗi chưa đạt để vượt điều kiện này.
 
 Chính sách nằm trong `model_policy` của `.pipeline/pipeline.config.json`.
 
@@ -112,8 +113,15 @@ Coding agent không thấy hội thoại này. Brief phải **tự chứa** — 
 
 ### b) Commit sạch rồi giao coding agent
 
-Worktree PHẢI sạch trước khi chạy coder, để `git diff` sau đó đúng bằng phần coding agent vừa làm.
-Nếu worktree bẩn: **dừng, hỏi user**. Không tự `git stash`, không tự commit gộp việc của người ta.
+Task mới cần worktree sạch. Brief và state do pipeline tạo cũng phải được xử lý trong
+commit chuẩn bị được user cho phép trước dispatch; không để chính chúng làm bẩn baseline.
+Nếu có thay đổi của user hoặc chưa rõ nguồn gốc: **dừng, hỏi user**. Không tự stash/commit gộp.
+Riêng retry cùng task: được dùng `-Resume` trên phần sửa dở đã review, thuộc đúng phạm vi
+brief và không lẫn thay đổi ngoài task. Ghi nhận status và nội dung hiện tại làm mốc retry;
+vẫn review toàn bộ thay đổi của task so với commit baseline gốc, không chỉ lượt sửa cuối.
+Thứ tự task mới: tăng/lưu `attempts` cùng state và brief → commit chuẩn bị được phép →
+kiểm tra sạch → dispatch. Không tăng/ghi state lần nữa giữa kiểm tra sạch và dispatch.
+Với retry, state/brief sửa đổi là metadata cùng task đã biết; giữ phần code dở để review.
 
 #### Chọn OpenCode
 
@@ -148,7 +156,8 @@ attach vào server của repo khác là coder đọc/sửa nhầm dự án. `oc-
 server mới cho repo đó (chờ tối đa 30 giây rồi tự kiểm lại). Vì vậy chạy nhiều repo song
 song được, mỗi repo chiếm một cổng trong dải. Nếu runner in
 `BLOCKED: phien opencode dang o ...` thì nghĩa là server đang bị repo khác chiếm — dùng
-`-NoTui`, hoặc đóng server đang chiếm cổng đó rồi chạy lại.
+URL/server đúng repo; `-NoTui` chỉ đổi hiển thị, không khắc phục server sai repo.
+Không tự đóng server của repo khác.
 
 **Đánh đổi khi dùng lại phiên:** context của opencode tích lũy qua các task, tốn thêm
 input token và có thể lẫn chỉ dẫn của task cũ. Khi muốn bắt đầu sạch cho một task,
@@ -239,7 +248,10 @@ Nội dung hội thoại do CLI lưu trên máy, còn map lưu liên kết để
 
 Đúng thứ tự, không bỏ bước:
 
-1. `git diff` — đọc toàn bộ thay đổi
+1. Chạy `git status --porcelain` để kiểm kê. Đọc `git diff` (unstaged), `git diff --cached`
+   (staged), và nội dung từng file untracked (`git ls-files --others --exclude-standard`).
+   Không coi diff rỗng là không có thay đổi. Đối chiếu tất cả với baseline gốc, danh sách
+   file được phép và `forbidden_paths`; binary cần cách kiểm tra phù hợp, không bỏ qua.
 2. Chạy test mục tiêu, rồi chạy **toàn bộ** suite. So với baseline đã đo ở bước b. **Chạy thật, đừng đoán.**
 3. Đối chiếu từng tiêu chí chấp nhận
 4. Soát checklist lỗi hay gặp:
@@ -255,13 +267,25 @@ Nội dung hội thoại do CLI lưu trên máy, còn map lưu liên kết để
 
 ### d) Quyết định
 
-- **Pass** → `git commit -m "<id>: <title>"`, status `done`, sang task kế.
-- **Fail, attempts < 3** → viết `.pipeline/tasks/<id>.fix-<n>.md` chứa **chỉ phát hiện cụ thể** (trích `file:dòng`, sai ở đâu, kỳ vọng gì). Gọi lại đúng runner đã chọn (`oc-coder` hoặc `codex-coder`) với `-Resume`. Tăng `attempts`.
+- **Pass** → stage đúng các file đã review (không `git add -A` mù quáng), kiểm tra staged diff lần cuối; cập nhật state `done` và commit task khi được phép. Không để việc ghi state sau commit làm bẩn task kế.
+- **Fail, attempts < 3** → viết `.pipeline/tasks/<id>.fix-<n>.md` với đường dẫn original brief
+  bắt buộc đọc, mục tiêu gốc, file được phép/cấm, luật liên quan, tiêu chí test, tiến độ và
+  việc còn lại. Thêm phát hiện cụ thể (`file:dòng`, sai ở đâu, kỳ vọng gì); không chỉ ghi
+  lỗi mà bỏ bối cảnh. Session có thể rollover, nên không dựa vào hội thoại cũ.
+  Xác nhận điều kiện retry cùng task ở bước b rồi giao đúng runner với `-Resume`;
+  kiểm tra/tăng/lưu `attempts` ngay trước dispatch, không tăng thêm sau khi nhận kết quả.
 - **Fail, attempts >= 3** → dừng. Báo user: task nào, hỏng gì, đề xuất (chẻ nhỏ / Claude tự làm / đổi cách). Đừng im lặng tự làm thay.
 
 ## Nguyên tắc
 
-- Mỗi task = mỗi commit. Không gộp.
+- Mỗi task có commit kết quả riêng, không gộp code của nhiều task. Commit chuẩn bị
+  brief/state tách biệt và chỉ thực hiện khi được phép.
 - Không tự sửa code của coding agent rồi commit chung — sẽ không biết coder thực sự làm được tới đâu. Hoặc feedback bắt sửa, hoặc escalate.
 - Sau mỗi task báo user một dòng: `T3 ✓ (2 lượt) — 4 file, N test pass`.
-- Cập nhật `.pipeline/state.json` trước khi sang task kế.
+- Hai lane dùng chung khóa writer theo repo. Gặp `BLOCKED`/exit 10 thì không tự xóa khóa.
+  Nếu có `.pipeline/logs/opencode-pending.json`, session timeout chưa được xác nhận dừng:
+  báo URL/session cho user, kiểm tra client đã dừng và abort/idle đúng session; chỉ dọn
+  marker sau khi user cho phép và xác nhận cả hai đã dừng. Không giết cả server dùng chung.
+- Chuyển dòng `TUI:`/`CONTEXT:` ngay trong lúc runner chạy nếu công cụ cho phép nhận output
+  trung gian. Nếu subagent không chuyển tiếp được, nói rõ giới hạn; không đợi kết thúc rồi
+  tuyên bố đã cung cấp link theo dõi từ đầu.

@@ -96,6 +96,7 @@ if (-not (Test-Path $logDir)) { New-Item -ItemType Directory -Path $logDir | Out
 $runLock = Join-Path $logDir "codex-run.lock"
 $script:runLockAcquired = $false
 $script:preserveRunLock = $false
+$script:runLockGuard = $null
 
 function Get-RunLockOwner {
   if (-not (Test-Path $runLock)) { return $null }
@@ -116,6 +117,14 @@ function Test-RunLockOwnerAlive($owner) {
 }
 
 function Acquire-RunLock {
+  # Serialize the entire check/reclaim/replace lifecycle across processes.
+  # The persistent guard file is never removed; only its OS handle is owned.
+  try {
+    $script:runLockGuard = [IO.File]::Open("$runLock.guard", [IO.FileMode]::OpenOrCreate, [IO.FileAccess]::ReadWrite, [IO.FileShare]::None)
+  } catch {
+    Write-Output 'BLOCKED: runner Codex khac dang giu run lock, hoac khong truy cap duoc lock guard.'
+    return
+  }
   $myStarted = (Get-Process -Id $PID).StartTime.ToUniversalTime().ToString("o")
   $payload = @{ pid = $PID; started = $myStarted } | ConvertTo-Json -Compress
   for ($attempt = 0; $attempt -lt 4; $attempt++) {
@@ -131,6 +140,10 @@ function Acquire-RunLock {
       Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue
     }
     $owner = Get-RunLockOwner
+    if ((Test-Path -LiteralPath $runLock) -and -not $owner) {
+      Write-Output 'BLOCKED: run lock khong doc duoc; khong tu thu hoi lock khong ro chu.'
+      return
+    }
     if (Test-RunLockOwnerAlive $owner) {
       Write-Output "BLOCKED: mot runner Codex khac dang chay trong repo nay (PID $($owner.pid)). Cho luot do xong roi chay lai; khong dong TUI cua no."
       return
@@ -187,7 +200,7 @@ function Preserve-RunLockForProcess($proc) {
     [IO.File]::WriteAllText($tmp, $payload, [Text.UTF8Encoding]::new($false))
     try {
       # Replace la atomic tren NTFS; fallback chi dung khi filesystem khong ho tro.
-      [IO.File]::Replace($tmp, $runLock, $null)
+      [IO.File]::Replace($tmp, $runLock, [NullString]::Value)
     } catch {
       [IO.File]::WriteAllText($runLock, $payload, [Text.UTF8Encoding]::new($false))
       Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue
@@ -213,8 +226,17 @@ function Stop-ManagedProcessTree($targetPid) {
   }
 }
 
+$pipelineGuard = $null
+try {
+  . (Join-Path $PSScriptRoot 'pipeline-runtime.ps1')
+  $pipelineGuard = Enter-PipelineRun $repo 'codex'
+} catch { Write-Output "BLOCKED: khong gianh duoc run lock cua repo: $($_.Exception.Message)"; exit 10 }
 Acquire-RunLock
-if (-not $script:runLockAcquired) { exit 10 }
+if (-not $script:runLockAcquired) {
+  if ($script:runLockGuard) { $script:runLockGuard.Dispose() }
+  if ($pipelineGuard) { $pipelineGuard.Dispose() }
+  exit 10
+}
 
 try {
 
@@ -692,7 +714,25 @@ namespace Pipeline {
       if (inputTask.IsFaulted) { var observed = inputTask.Exception; }
       return Process.ExitCode;
     }
+    private int disposed;
     public void Dispose() {
+      if (System.Threading.Interlocked.Exchange(ref disposed, 1) != 0) return;
+      // Closing a synchronous pipe with a pending ReadAsync can block until
+      // an unkillable child exits. Defer cleanup, never block timeout return.
+      Task finished = Task.WhenAll(new Task[] {
+        inputTask ?? Task.FromResult(0), outputTask ?? Task.FromResult(0), errorTask ?? Task.FromResult(0)
+      });
+      if (finished.IsCompleted) {
+        if (finished.IsFaulted) { var observed = finished.Exception; }
+        DisposeCore();
+      } else {
+        finished.ContinueWith(done => {
+          if (done.IsFaulted) { var observed = done.Exception; }
+          DisposeCore();
+        }, TaskScheduler.Default);
+      }
+    }
+    private void DisposeCore() {
       if (input != null) input.Dispose();
       if (output != null) output.Dispose();
       if (error != null) error.Dispose();
@@ -706,6 +746,25 @@ namespace Pipeline {
 }
 
 $head = & git rev-parse HEAD
+
+function Get-WorktreeFingerprint {
+  $rawPaths = (& git -C $repo -c core.quotepath=false ls-files -z --modified --deleted --others --exclude-standard) -join "`n"
+  if ($LASTEXITCODE -ne 0) { throw 'Cannot snapshot worktree paths.' }
+  $stagedPaths = (& git -C $repo -c core.quotepath=false diff --cached --name-only -z) -join "`n"
+  if ($LASTEXITCODE -ne 0) { throw 'Cannot snapshot index paths.' }
+  $rawPaths += "`0" + $stagedPaths
+  $entries = foreach ($relative in @($rawPaths -split "`0" | Where-Object { $_ } | Sort-Object -Unique)) {
+    $path = Join-Path $repo $relative
+    if (Test-Path -LiteralPath $path -PathType Leaf) {
+      '{0}:{1}' -f $relative, (Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash
+    } elseif (Test-Path -LiteralPath $path -PathType Container) {
+      '{0}:submodule:{1}:{2}' -f $relative, ((& git -C $path rev-parse HEAD) -join ''), ((& git -C $path status --porcelain) -join "`n")
+    } else { '{0}:deleted' -f $relative }
+  }
+  $indexState = (& git -C $repo diff --cached --raw --no-abbrev) -join "`n"
+  if ($LASTEXITCODE -ne 0) { throw 'Cannot snapshot index state.' }
+  return (($entries -join "`n") + "`nINDEX:`n" + $indexState)
+}
 
 # Mac dinh la TUI goc cua Codex. -Exec hoac -NoTui quay ve duong codex exec.
 $useTui = ((-not $Exec) -and (-not $NoTui))
@@ -734,7 +793,7 @@ if ($useTui) {
   Write-Output "TUI: cua so Codex goc"
 
   # Trang thai worktree truoc khi chay, de biet luot nay co sua gi khong.
-  $beforeStatus = (& git status --porcelain) -join "`n"
+  $beforeFingerprint = Get-WorktreeFingerprint
 
   # Moi repo chi giu mot cua so TUI do runner mo, bat ke no thuoc phien Claude
   # nao. Phai dong no truoc khi resume/tao moi, neu khong Windows se tich cua so.
@@ -877,7 +936,7 @@ if ($useTui) {
   })
 
   # Trang thai worktree truoc khi chay, de biet luot nay co sua gi khong.
-  $beforeStatus = (& git status --porcelain) -join "`n"
+  $beforeFingerprint = Get-WorktreeFingerprint
 
   $sw = [Diagnostics.Stopwatch]::StartNew()
   $errLog = "$log.err"
@@ -935,13 +994,13 @@ $changed = & git status --porcelain
 $stat = & git diff --stat
 
 # Tin hieu "luot nay co lam gi": log file_change bat duoc viec sua lai file dang do
-# (porcelain khong doi), con so sanh porcelain bat duoc viec sua bang lenh shell
+# (porcelain khong doi), con so sanh noi dung bat duoc viec sua bang lenh shell
 # (log khong co file_change). Phai dung hop ca hai.
-$afterStatus = ($changed) -join "`n"
+$contentChanged = (Get-WorktreeFingerprint) -ne $beforeFingerprint
 if ($useTui) {
-  $didWork = ($nativeFileChangeCount -gt 0) -or ($afterStatus -ne $beforeStatus)
+  $didWork = ($nativeFileChangeCount -gt 0) -or $contentChanged
 } else {
-  $didWork = ((Get-FileChangeCount $log) -gt 0) -or ($afterStatus -ne $beforeStatus)
+  $didWork = ((Get-FileChangeCount $log) -gt 0) -or $contentChanged
 }
 
 # Codex thoat khac 0 la runner/CLI hong, khong phai model tu choi task.
@@ -969,12 +1028,21 @@ if ($changed) {
     try {
       # 2>&1 phai nam trong chuoi IEX: redirect ben ngoai khong bat duoc stderr cua lenh native.
       $LASTEXITCODE = 0
-      $testsText = (Invoke-Expression ($testCommand + " 2>&1") | Out-String)
+      $testOutput = @(Invoke-Expression ("& { " + $testCommand + "`n} 2>&1"))
+      $testsText = $testOutput | Out-String
       $testExitCode = $LASTEXITCODE
       $testsRan = $true
       if ($testExitCode -ne 0) { $testsFailed = $true }
+      # Native stderr may be a harmless warning with exit 0. PowerShell errors
+      # are different: LASTEXITCODE remains 0 for Write-Error/missing commands.
+      foreach ($item in $testOutput) {
+        if ($item -is [Management.Automation.ErrorRecord] -and
+            $item.FullyQualifiedErrorId -notmatch '^NativeCommandError') { $testsFailed = $true }
+      }
     } catch {
-      $testsRan = $false
+      $testsRan = $true
+      $testsFailed = $true
+      $testsText = $_ | Out-String
     }
     $ErrorActionPreference = $prevEAP
   }
@@ -1024,7 +1092,11 @@ if (-not $didWork) { exit 5 }
 exit 0
 
 } finally {
-  if ($execProcess) { $execProcess.Dispose() }
-  # Moi duong thoat (exit thuong, exit loi, timeout) deu phai tra run lock.
-  if ($script:runLockAcquired) { Release-RunLock }
+  try {
+    if ($execProcess) { $execProcess.Dispose() }
+    if ($script:runLockAcquired) { Release-RunLock }
+  } finally {
+    if ($script:runLockGuard) { $script:runLockGuard.Dispose() }
+    if ($pipelineGuard) { $pipelineGuard.Dispose() }
+  }
 }

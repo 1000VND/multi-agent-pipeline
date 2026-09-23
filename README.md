@@ -19,7 +19,18 @@ Gói **chỉ chạy trên Windows**: toàn bộ là Windows PowerShell 5.1, có 
 `install.ps1` in báo cáo `== DIEU KIEN CHAY ==` với OK/THIEU cho từng thứ; thiếu thì không
 fail, chỉ báo lane nào không dùng được.
 
+Kiểm thử tooling bằng Windows PowerShell 5.1/Pester (CLI và HTTP giả, không gọi model thật):
+
+```powershell
+powershell.exe -NoProfile -Command '$r = Invoke-Pester -Script tests -PassThru; if ($r.FailedCount -gt 0) { exit 1 }'
+```
+
+Không dùng `pwsh`/PowerShell 7 để thay thế môi trường kiểm thử này.
+
 ## Cài đặt
+
+Dừng các runner đang chạy trước khi cập nhật/cài lại tooling; không chạy xen kẽ runner
+bản cũ và mới trong cùng repo. `pipeline-runtime.ps1` phải được cài cùng hai runner.
 
 ```powershell
 git clone https://github.com/1000VND/multi-agent-pipeline.git
@@ -123,6 +134,32 @@ Nếu primary DeepSeek V4.1 Flash báo hết quota/rate limit hoặc model khôn
 **LongCat-2.0** (`high`) → **MiMo V2.5 Pro** → **DeepSeek V4 Flash Vision Exp** (`max`)
 → **DeepSeek V4 Flash** (`max`).
 Runner dừng chuỗi khi một model đã sửa file, timeout, hoặc lỗi tham số CLI.
+Log OpenCode dùng `--format json`: chỉ sự kiện lỗi API (hoặc dòng lỗi CLI rõ ràng
+kèm exit code thất bại) kích hoạt nhánh quota; câu trả lời nhắc tới quota không kích hoạt.
+
+Hai backend giữ chung khóa `.pipeline/logs/pipeline-run.guard` suốt lượt chạy,
+kể cả fallback và verify. Khóa riêng từng lane được giữ để tương thích khi nâng cấp.
+Lượt chạy chồng cùng repo, kể cả Codex chạy đồng thời OpenCode, thoát `10` trước khi chọn
+session hoặc đóng TUI. File khóa có thể còn trên đĩa sau khi kết thúc; quyền giữ
+khóa nằm ở handle hệ điều hành, không phải sự tồn tại của file. Không tự xóa file này.
+
+Khi đóng TUI OpenCode, runner đối chiếu PID, tên `cmd` và thời điểm khởi động thực.
+Bản ghi cũ thiếu thời điểm hoặc PID bị tái sử dụng được bỏ qua, không kill nhầm.
+Nếu không đóng được đúng cửa sổ đã quản lý, helper giữ bản ghi và thoát `10`.
+Runner bảo toàn mã này khi trả về caller.
+
+Timeout OpenCode: dừng client, gọi abort đúng session trên server và kiểm tra trạng thái.
+Nếu chưa xác nhận cả client và session đã dừng, giữ `.pipeline/logs/opencode-pending.json`;
+cả hai backend sẽ bị chặn với `10`. File này không tự hết hạn. Đọc URL/session/repo trong
+marker, xác minh client đã dừng và session đã abort/idle đúng repo, rồi xin user cho phép
+dọn marker. Không xóa marker chỉ vì PID runner đã chết; không kill toàn bộ server để dọn.
+
+Với `-Resume`, cả hai runner so sánh nội dung file trước/sau lượt chạy, không tính phần
+sửa dở cũ là kết quả mới, kể cả khi gọi từ thư mục con. Không sửa gì thì thoát `5`;
+CLI lỗi hoặc OpenCode có JSON error event thì thoát `7` dù CLI trả `0` và có
+file thay đổi, giữ nguyên các file để review. Không thử fallback đè lên worktree bẩn.
+Ở cả hai lane, lệnh test đã cấu hình mà phát sinh exception/lỗi PowerShell cũng
+được tính là verify thất bại (`8`), không còn bỏ qua rồi trả thành công.
 
 ## Lane Codex
 
@@ -137,13 +174,16 @@ Runner dừng chuỗi khi một model đã sửa file, timeout, hoặc lỗi tha
   khởi động bị bỏ qua (cửa sổ cũ có thể còn mở) thay vì giết nhầm PID đã bị tái sử dụng.
 - Mỗi repo chỉ chạy một `codex-run.ps1` tại một thời điểm nhờ **run lock** theo repo
   (`.pipeline/logs/codex-run.lock`, đã ignore). Lượt chồng lên thoát ngay với
-  `BLOCKED: ... (PID ...)` và không đụng TUI của lượt đang chạy; lock của tiến trình
+  `BLOCKED: ...` và không đụng TUI của lượt đang chạy; lock của tiến trình
   đã chết được tự thu hồi. Không giành được lock vì lý do khác cũng `exit 10` — runner
-  không bao giờ chạy khi thiếu lock.
+  không bao giờ chạy khi thiếu lock. Handle độc quyền `codex-run.lock.guard` bảo vệ
+  toàn bộ vòng đời khóa, kể cả thu hồi khóa cũ; không xóa file guard đang dùng.
+  Bản ghi khóa không đọc được bị chặn để kiểm tra thủ công, không tự thu hồi.
 - Nếu không đóng được TUI cũ đã quản lý, runner dừng với `exit 10` thay vì mở thêm
   TUI. Khi timeout mà `taskkill` không giết được Codex, lock được chuyển sang PID
   Codex còn sống; các lượt sau vẫn bị chặn đến khi tiến trình đó tự kết thúc hoặc được
-  người dùng đóng thủ công.
+  người dùng đóng thủ công. Headless không chờ đóng pipe của tiến trình không kill
+  được trước khi trả timeout; shell gọi bên ngoài vẫn có thể tự chờ tiến trình con.
 - `-Exec` hoặc `-NoTui` chạy headless, không mở cửa sổ nào.
   Nếu đã có thread, runner in `TUI: codex resume <thread-id>` để mở lại đúng phiên;
   lượt tạo thread mới sẽ in lệnh này ngay khi Codex trả về thread ID.
@@ -161,7 +201,14 @@ Cả hai lane kiểm tra context trước khi giao lượt mới. Nếu context 
 tạo session mới gắn với cùng khóa Claude rồi gửi brief vào session mới. Đúng 80% vẫn
 dùng tiếp. Với OpenCode, kiểm tra cũng chạy trước lượt fallback. Task đang chạy không
 bị ngắt giữa chừng; session mới đọc brief và file của repo, không tự sao chép toàn bộ
-hội thoại cũ. Vì vậy brief sửa lỗi cần ghi đủ tiến độ và việc còn lại.
+hội thoại cũ. Vì vậy brief sửa lỗi phải dẫn original brief bắt buộc đọc, kèm mục tiêu,
+phạm vi file, luật cấm, tiêu chí test, tiến độ và việc còn lại.
+
+Review phải đọc unstaged diff, staged diff và nội dung untracked, không chỉ `git diff`.
+Mỗi task tối đa 3 lần dispatch runner kể cả lượt đầu; tăng/lưu attempts một lần trước
+mỗi lượt. Retry cùng task được dùng `-Resume` trên phần sửa dở đã review, không lẫn việc
+của user. Codex escalation dùng `-FreshSession`; OpenCode tạo phiên mới dùng `-FreshTui`,
+không có bậc escalated tương đương. Khi cần xử lý phần sửa dở để đổi model/backend, hỏi user.
 
 Ngưỡng có thể chỉnh bằng số nguyên 1–99 trong `.pipeline/pipeline.config.json`
 (thiếu hoặc giá trị không hợp lệ thì dùng 80):
@@ -203,9 +250,9 @@ runner để lịch sử được gắn đúng phiên.
 | 5 | lượt này không sửa gì — coi như thất bại |
 | 6 | `oc-tui.ps1` không trả về session id (chỉ lane OpenCode) |
 | 7 | CLI hỏng cứng, không phải model từ chối task |
-| 8 | có thay đổi nhưng `test_command` fail |
+| 8 | có thay đổi nhưng `test_command` fail hoặc không thực thi được |
 | 9 | phiên opencode thuộc repo khác — chặn để khỏi sửa nhầm dự án (chỉ lane OpenCode) |
-| 10 | không giành được run lock: runner Codex khác đang chạy, hoặc lock hỏng/không truy cập được — runner từ chối chạy, không đóng TUI của lượt kia (chỉ lane Codex) |
+| 10 | không giành được run lock của lane trong repo, hoặc không đóng được TUI đã quản lý — từ chối chạy chồng |
 | 11 | thiếu danh tính phiên Claude: không có `-Key` và cả hai env `CLAUDE_CODE_*` đều trống — coder không chạy |
 | 124 | quá `timeout_sec`. Lane Codex: thử giết cả cây tiến trình; nếu không giết được thì giữ run lock theo PID còn sống. Lane OpenCode: dừng lượt và không thử fallback. |
 

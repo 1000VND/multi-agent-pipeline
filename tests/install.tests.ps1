@@ -51,6 +51,9 @@ Describe "installer config migrations" {
     $result = Invoke-TestInstaller $installSandbox
     $result.code | Should Be 0
     (Read-InstallConfig $installSandbox).session_rollover.context_percent | Should Be 80
+    $runtime = Join-Path $installSandbox.root '.pipeline\bin\pipeline-runtime.ps1'
+    (Test-Path $runtime) | Should Be $true
+    (Get-FileHash $runtime).Hash | Should Be (Get-FileHash (Join-Path $script:installPackageRoot 'bin\pipeline-runtime.ps1')).Hash
   }
 
   It "migrates legacy fallback while preserving project and custom settings" {

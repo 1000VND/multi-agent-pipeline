@@ -159,6 +159,7 @@ function Invoke-Runner {
     [hashtable]$Sandbox,
     [string]$Key = "",
     [switch]$FreshSession,
+    [switch]$Resume,
     [switch]$NoTui,
     [int]$TimeoutSec = 0,
     [string]$Thread = "",
@@ -166,6 +167,8 @@ function Invoke-Runner {
     [string]$ClaudeSession = "",
     [string]$Session = "",
     [switch]$Sleep,
+    [switch]$BoundedWait,
+    [string]$WorkingDirectory = '',
     [switch]$Touch,
     [string]$CodexHome = "",
     [switch]$WriteRollout
@@ -200,15 +203,31 @@ function Invoke-Runner {
   if ($Key) { $argList += @("-Key", $Key) }
   if ($Session) { $argList += @("-Session", $Session) }
   if ($FreshSession) { $argList += "-FreshSession" }
+  if ($Resume) { $argList += "-Resume" }
   if ($NoTui) { $argList += "-NoTui" }
   if ($TimeoutSec -gt 0) { $argList += @("-TimeoutSec", [string]$TimeoutSec) }
   $outPath = Join-Path $Sandbox.out ("run-" + [guid]::NewGuid().ToString("N").Substring(0, 8) + ".txt")
   $errPath = "$outPath.err"
   try {
-  Push-Location $Sandbox.repo
+  Push-Location $(if ($WorkingDirectory) { $WorkingDirectory } else { $Sandbox.repo })
   try {
-    & powershell.exe @argList 1>$outPath 2>$errPath
-    $runnerCode = $LASTEXITCODE
+    if ($BoundedWait) {
+      # Native PowerShell invocation can wait for the whole descendant job;
+      # measure the runner itself, independently of its retained child.
+      $quotedArgs = @($argList | ForEach-Object { '"' + $_ + '"' })
+      $parent = Start-Process powershell.exe -ArgumentList $quotedArgs -WorkingDirectory $Sandbox.repo -WindowStyle Hidden -PassThru -RedirectStandardOutput $outPath -RedirectStandardError $errPath
+      try {
+        $parentHandle = $parent.Handle
+        if (-not $parent.WaitForExit(15000)) {
+          $parent.Kill()
+          throw 'Runner exceeded the bounded 15 second test deadline'
+        }
+        $runnerCode = $parent.ExitCode
+      } finally { $parent.Dispose() }
+    } else {
+      & powershell.exe @argList 1>$outPath 2>$errPath
+      $runnerCode = $LASTEXITCODE
+    }
   } finally {
     Pop-Location
   }
@@ -727,10 +746,10 @@ Describe "codex-run headless command path" {
 }
 
 Describe "codex-run test command exit status" {
-  BeforeAll {
+  BeforeEach {
     $sandbox = New-Sandbox
   }
-  AfterAll {
+  AfterEach {
     Remove-Sandbox $sandbox
   }
 
@@ -740,6 +759,103 @@ Describe "codex-run test command exit status" {
     $r = Invoke-Runner -Sandbox $sandbox -Key "test-exit-key" -Thread "thread-test-exit" -NoTui -Touch
     $r.code | Should Be 8
     $r.text | Should Match "TESTS: FAILED"
+  }
+
+  It "fails verification on a terminating PowerShell exception" {
+    Set-TestCommand $sandbox 'throw "verify failed"'
+    $r = Invoke-Runner -Sandbox $sandbox -Key 'verify' -NoTui -Touch
+    $r.code | Should Be 8
+    $r.text | Should Match 'TESTS: FAILED'
+  }
+
+  It "fails verification on nonterminating errors even followed by successful output" {
+    Set-TestCommand $sandbox 'Write-Error "verify failed"; Write-Output "done"'
+    $r = Invoke-Runner -Sandbox $sandbox -Key 'verify' -NoTui -Touch
+    $r.code | Should Be 8
+  }
+
+  It "does not turn harmless native stderr with exit zero into a failed verification" {
+    Set-TestCommand $sandbox 'cmd.exe /d /c "echo harmless warning 1>&2 & exit /b 0"'
+    $r = Invoke-Runner -Sandbox $sandbox -Key 'verify' -NoTui -Touch
+    $r.code | Should Be 0
+  }
+}
+
+Describe "codex-run medium priority safety regressions" {
+  BeforeEach { $sandbox = New-Sandbox }
+  AfterEach { Remove-Sandbox $sandbox }
+
+  It "detects resume edits when invoked from a subdirectory" {
+    $subdir = Join-Path $sandbox.repo 'src'
+    New-Item -ItemType Directory -Path $subdir | Out-Null
+    Set-Content (Join-Path $sandbox.repo 'fake-change.txt') old
+    (Invoke-Runner $sandbox -Key medium -Session fixture -NoTui -Resume -Touch -WorkingDirectory $subdir).code | Should Be 0
+  }
+
+  It "blocks Codex while a shared writer guard is held" {
+    $path = Join-Path $sandbox.repo '.pipeline\logs\pipeline-run.guard'
+    $guard = [IO.File]::Open($path, 'OpenOrCreate', 'ReadWrite', 'None')
+    try {
+      (Invoke-Runner $sandbox -Key medium -NoTui).code | Should Be 10
+      @(Get-FakeCalls $sandbox).Count | Should Be 0
+    } finally { $guard.Dispose() }
+  }
+
+  It "blocks Codex when an OpenCode timeout has not been confirmed stopped" {
+    '{}' | Set-Content (Join-Path $sandbox.repo '.pipeline\logs\opencode-pending.json')
+    (Invoke-Runner $sandbox -Key medium -NoTui).code | Should Be 10
+    @(Get-FakeCalls $sandbox).Count | Should Be 0
+  }
+
+  It "detects new edits to an already untracked file on resume" {
+    Set-Content (Join-Path $sandbox.repo 'fake-change.txt') 'old'
+    (Invoke-Runner $sandbox -Key medium -Session fixture -NoTui -Resume -Touch).code | Should Be 0
+  }
+
+  It "detects new edits to an already modified tracked file on resume" {
+    Set-Content (Join-Path $sandbox.repo 'fake-change.txt') 'baseline'
+    & git -C $sandbox.repo add fake-change.txt
+    & git -C $sandbox.repo commit -qm baseline
+    Set-Content (Join-Path $sandbox.repo 'fake-change.txt') 'old'
+    (Invoke-Runner $sandbox -Key medium -Session fixture -NoTui -Resume -Touch).code | Should Be 0
+  }
+
+  It "does not count unchanged dirty content as new work" {
+    Set-Content (Join-Path $sandbox.repo 'fake-change.txt') 'old'
+    (Invoke-Runner $sandbox -Key medium -Session fixture -NoTui -Resume).code | Should Be 5
+  }
+
+  It "cannot reclaim a stale JSON record while another runner holds the guard" {
+    $lock = Join-Path $sandbox.repo '.pipeline\logs\codex-run.lock'
+    '{"pid":2147483647}' | Set-Content $lock
+    $handle = [IO.File]::Open("$lock.guard", 'OpenOrCreate', 'ReadWrite', 'None')
+    try {
+      (Invoke-Runner $sandbox -Key medium -NoTui).code | Should Be 10
+      @(Get-FakeCalls $sandbox).Count | Should Be 0
+      (Get-Content -Raw $lock | ConvertFrom-Json).pid | Should Be 2147483647
+    } finally { $handle.Dispose() }
+    (Invoke-Runner $sandbox -Key medium -NoTui).code | Should Be 5
+    (Test-Path $lock) | Should Be $false
+    (Test-Path "$lock.guard") | Should Be $true
+  }
+
+  It "fails closed on an unreadable owner record" {
+    '{broken' | Set-Content (Join-Path $sandbox.repo '.pipeline\logs\codex-run.lock')
+    (Invoke-Runner $sandbox -Key medium -NoTui).code | Should Be 10
+    @(Get-FakeCalls $sandbox).Count | Should Be 0
+  }
+
+  It "returns promptly after kill denial and preserves exclusion for the surviving child" {
+    $watch = [Diagnostics.Stopwatch]::StartNew()
+    $r = Invoke-Runner $sandbox -Key medium -NoTui -Sleep -TimeoutSec 2 -BoundedWait
+    $watch.Stop()
+    $r.code | Should Be 124
+    ($watch.Elapsed.TotalSeconds -lt 15) | Should Be $true
+    $owner = Get-Content -Raw (Join-Path $sandbox.repo '.pipeline\logs\codex-run.lock') | ConvertFrom-Json
+    $owner.retained_for | Should Be 'codex-timeout'
+    (Get-Process -Id $owner.pid -ErrorAction SilentlyContinue) | Should Not BeNullOrEmpty
+    (Invoke-Runner $sandbox -Key medium -NoTui).code | Should Be 10
+    @(Get-FakeCalls $sandbox).Count | Should Be 1
   }
 }
 

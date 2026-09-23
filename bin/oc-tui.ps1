@@ -237,20 +237,46 @@ if ([string]::IsNullOrWhiteSpace($Key) -and -not $CloseOnly) {
 if ($Session -and $Fresh) { throw "Khong the dung -Session va -Fresh cung luc." }
 Write-Output "  phien Claude: $Key"
 
+function Get-OpenCodeProcessStart($process) {
+  try { return $process.StartTime.ToUniversalTime().ToString('o') } catch { return $null }
+}
+
+function Close-ManagedOpenCodeTui {
+  $win = Read-Json $winFile
+  if (-not $win -or -not $win.pid) { return $true }
+  $proc = Get-Process -Id $win.pid -ErrorAction SilentlyContinue
+  if ($proc -and $proc.ProcessName -eq 'cmd') {
+    $started = Get-OpenCodeProcessStart $proc
+    if (-not $win.proc_started -or -not $started -or $started -ne $win.proc_started) {
+      Write-Host "CANH BAO: khong xac minh duoc TUI PID $($win.pid); khong dong de tranh giet nham."
+    } else {
+      $previousEAP = $ErrorActionPreference
+      try {
+        $ErrorActionPreference = 'Continue'
+        & taskkill.exe /PID $win.pid /T /F 2>&1 | Out-Null
+      } finally { $ErrorActionPreference = $previousEAP }
+      $deadline = (Get-Date).AddSeconds(3)
+      do {
+        $remaining = Get-Process -Id $win.pid -ErrorAction SilentlyContinue
+        if (-not $remaining -or (Get-OpenCodeProcessStart $remaining) -ne $started) { break }
+        Start-Sleep -Milliseconds 100
+      } while ((Get-Date) -lt $deadline)
+      if ($remaining -and (Get-OpenCodeProcessStart $remaining) -eq $started) {
+        Write-Host "BLOCKED: khong dong duoc TUI PID $($win.pid); giu ban ghi, khong mo them cua so."
+        return $false
+      }
+      Write-Host "  dong cua so cu (PID $($win.pid))"
+    }
+  }
+  Remove-Item -LiteralPath $winFile -Force -ErrorAction SilentlyContinue
+  return $true
+}
+
 # ---------- 1. dong cua so dang mo ----------
 # Headless van can session/URL de nguoi dung co the attach lai sau nay, nhung
 # khong duoc dong TUI ma ho dang xem.
 if (-not $NoWindow) {
-  $win = Read-Json $winFile
-  if ($win -and $win.pid) {
-    $proc = Get-Process -Id $win.pid -ErrorAction SilentlyContinue
-    # chi giet dung cmd.exe ta da spawn; Windows tai su dung PID nen phai kiem
-    if ($proc -and $proc.ProcessName -eq "cmd") {
-      & taskkill /PID $win.pid /T /F 2>&1 | Out-Null
-      Write-Output "  dong cua so cu (PID $($win.pid))"
-    }
-    Remove-Item $winFile -Force -ErrorAction SilentlyContinue
-  }
+  if (-not (Close-ManagedOpenCodeTui)) { exit 10 }
 }
 if ($CloseOnly) { Write-Output "CloseOnly: xong."; exit 0 }
 
@@ -426,7 +452,7 @@ if (-not $NoWindow) {
             -ArgumentList @("/k", "title opencode $sid && opencode attach $Url -s $sid") `
             -WorkingDirectory $repo -PassThru
 
-  @{ pid = $proc.Id; sid = $sid; key = $Key; started = (Get-Date).ToString("s") } |
+  @{ pid = $proc.Id; sid = $sid; key = $Key; started = (Get-Date).ToString("s"); proc_started = (Get-OpenCodeProcessStart $proc) } |
     ConvertTo-Json | Set-Content -Path $winFile -Encoding utf8
 
   Write-Output "  mo cua so TUI (PID $($proc.Id))"

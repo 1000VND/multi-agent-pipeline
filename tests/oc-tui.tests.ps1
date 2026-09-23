@@ -39,6 +39,62 @@ function Invoke-TestTui([switch]$Fresh, [string]$Session = "") {
   }
 }
 
+Describe "OpenCode TUI process identity" {
+  BeforeAll {
+    $ast = [Management.Automation.Language.Parser]::ParseFile($script:tuiSource, [ref]$null, [ref]$null)
+    foreach ($name in @('Read-Json','Get-OpenCodeProcessStart','Close-ManagedOpenCodeTui')) {
+      $definition = $ast.Find({param($node) $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq $name}, $true)
+      . ([scriptblock]::Create($definition.Extent.Text))
+    }
+  }
+  BeforeEach {
+    $winFile = Join-Path $TestDrive 'tui.json'
+    $global:PipelineTuiPidFixture = @{alive=$true; deny=$false; name='cmd'; start=[datetime]'2026-09-21T01:00:00Z'; calls=0}
+    @{pid=12345; proc_started=$global:PipelineTuiPidFixture.start.ToUniversalTime().ToString('o')} | ConvertTo-Json | Set-Content -LiteralPath $winFile
+    Mock Get-Process {
+      $state = $global:PipelineTuiPidFixture
+      if ($state.alive) { return [pscustomobject]@{Id=12345; ProcessName=$state.name; StartTime=$state.start} }
+    }
+    Mock taskkill.exe {
+      $global:PipelineTuiPidFixture.calls++
+      if (-not $global:PipelineTuiPidFixture.deny) { $global:PipelineTuiPidFixture.alive=$false }
+    }
+  }
+  AfterAll { Remove-Variable -Name PipelineTuiPidFixture -Scope Global -ErrorAction SilentlyContinue }
+
+  It "never kills a recycled PID with a different process start time" {
+    $global:PipelineTuiPidFixture.start = $global:PipelineTuiPidFixture.start.AddMinutes(1)
+    (Close-ManagedOpenCodeTui) | Should Be $true
+    $global:PipelineTuiPidFixture.calls | Should Be 0
+  }
+  It "never kills a legacy PID without a recorded process start time" {
+    '{"pid":12345}' | Set-Content -LiteralPath $winFile
+    (Close-ManagedOpenCodeTui) | Should Be $true
+    $global:PipelineTuiPidFixture.calls | Should Be 0
+  }
+  It "does not kill a different process name" {
+    $global:PipelineTuiPidFixture.name = 'powershell'
+    (Close-ManagedOpenCodeTui) | Should Be $true
+    $global:PipelineTuiPidFixture.calls | Should Be 0
+  }
+  It "removes dead process records without killing anything" {
+    $global:PipelineTuiPidFixture.alive = $false
+    (Close-ManagedOpenCodeTui) | Should Be $true
+    $global:PipelineTuiPidFixture.calls | Should Be 0
+    (Test-Path $winFile) | Should Be $false
+  }
+  It "closes the matching managed process and removes its record" {
+    (Close-ManagedOpenCodeTui) | Should Be $true
+    $global:PipelineTuiPidFixture.calls | Should Be 1
+    (Test-Path $winFile) | Should Be $false
+  }
+  It "blocks another window and preserves the record if close is denied" {
+    $global:PipelineTuiPidFixture.deny = $true
+    (Close-ManagedOpenCodeTui) | Should Be $false
+    (Test-Path $winFile) | Should Be $true
+  }
+}
+
 Describe "OpenCode session context rollover and complete association history" {
   AfterAll {
     Remove-Variable -Name PipelineOcTuiTestState -Scope Global -ErrorAction SilentlyContinue

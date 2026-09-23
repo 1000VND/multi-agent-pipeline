@@ -112,6 +112,45 @@ if ($pipelineConfig) { $testCommand = [string]$pipelineConfig.test_command }
 if (-not (Test-Path $TaskFile)) { Write-Output "Khong thay task file: $TaskFile"; exit 2 }
 $taskFilePath = (Resolve-Path -LiteralPath $TaskFile).Path
 
+# OS-owned exclusive handle covers session selection, all fallback attempts and
+# verification. A crash releases the handle; never delete/reclaim the lock file.
+$logDir = Join-Path $repo '.pipeline\logs'
+if (-not (Test-Path -LiteralPath $logDir)) { New-Item -ItemType Directory -Path $logDir -Force | Out-Null }
+$runLockHandle = $null
+$pipelineGuard = $null
+try {
+  . (Join-Path $PSScriptRoot 'pipeline-runtime.ps1')
+  $pipelineGuard = Enter-PipelineRun $repo 'opencode'
+  $runLockHandle = [IO.File]::Open((Join-Path $logDir 'opencode-run.lock'), [IO.FileMode]::OpenOrCreate, [IO.FileAccess]::ReadWrite, [IO.FileShare]::None)
+} catch {
+  if ($pipelineGuard) { $pipelineGuard.Dispose() }
+  Write-Output "BLOCKED: khong gianh duoc run lock cua repo: $($_.Exception.Message)"
+  exit 10
+}
+try {
+
+# Compare content, not just porcelain: a resumed task may modify a file that
+# was already dirty. Git supplies NUL-separated paths, including untracked files.
+function Get-WorktreeFingerprint {
+  $rawPaths = (& git -C $repo -c core.quotepath=false ls-files -z --modified --deleted --others --exclude-standard) -join "`n"
+  if ($LASTEXITCODE -ne 0) { throw 'Cannot snapshot worktree paths.' }
+  $stagedPaths = (& git -C $repo -c core.quotepath=false diff --cached --name-only -z) -join "`n"
+  if ($LASTEXITCODE -ne 0) { throw 'Cannot snapshot index paths.' }
+  $rawPaths += "`0" + $stagedPaths
+  $entries = foreach ($relative in @($rawPaths -split "`0" | Where-Object { $_ } | Sort-Object -Unique)) {
+    $path = Join-Path $repo $relative
+    if (Test-Path -LiteralPath $path -PathType Leaf) {
+      '{0}:{1}' -f $relative, (Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash
+    } elseif (Test-Path -LiteralPath $path -PathType Container) {
+      # A tracked submodule is a directory, not a file.
+      '{0}:submodule:{1}:{2}' -f $relative, ((& git -C $path rev-parse HEAD) -join ''), ((& git -C $path status --porcelain) -join "`n")
+    } else { '{0}:deleted' -f $relative }
+  }
+  $indexState = (& git -C $repo diff --cached --raw --no-abbrev) -join "`n"
+  if ($LASTEXITCODE -ne 0) { throw 'Cannot snapshot index state.' }
+  return (($entries -join "`n") + "`nINDEX:`n" + $indexState)
+}
+
 # Bat buoc worktree sach truoc khi giao viec -> git diff sau do = dung
 # phan opencode vua lam, khong lan voi thay doi cu.
 $dirty = & git status --porcelain
@@ -185,7 +224,8 @@ function Sync-OpenCodeSession {
   $tui | ForEach-Object { Write-Host $_ }
   $line = $tui | Where-Object { $_ -match "^SESSION=" } | Select-Object -Last 1
   $urlLine = $tui | Where-Object { $_ -match "^URL=" } | Select-Object -Last 1
-  if ($tuiCode -ne 0 -or -not $line -or -not $urlLine) { throw "oc-tui.ps1 khong tra ve session/URL hop le (exit=$tuiCode)." }
+  if ($tuiCode -ne 0) { Write-Host "BLOCKED: oc-tui.ps1 exit=$tuiCode"; exit $tuiCode }
+  if (-not $line -or -not $urlLine) { throw 'oc-tui.ps1 khong tra ve session/URL hop le.' }
   $script:Session = $line -replace "^SESSION=", ""
   $script:Attach = $urlLine -replace "^URL=", ""
   $script:tuiHint = "opencode attach $($script:Attach) -s $($script:Session)"
@@ -197,7 +237,7 @@ function Sync-OpenCodeSession {
     # User chose TUI: move the visible window to the replacement session too.
     & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $PSScriptRoot "oc-tui.ps1") `
       -Key $Key -Url $script:Attach -Session $script:Session | ForEach-Object { Write-Host $_ }
-    if ($LASTEXITCODE -ne 0) { throw "Khong mo lai duoc TUI sau rollover." }
+    if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
   }
   $script:dispatchCount++
 }
@@ -238,22 +278,48 @@ Write-Output "CLI: $openCodePath"
 # opencode in usage/help khi prompt khong toi noi nguyen ven -> nhan dien de khong dot fallback.
 function Test-ArgError($logPath) {
   if (-not (Test-Path $logPath)) { return $false }
-  $head = Get-Content -Path $logPath -TotalCount 5 -ErrorAction SilentlyContinue
-  return [bool]($head -match 'opencode run \[message')
+  foreach ($line in @(Get-Content -Path $logPath -TotalCount 5 -ErrorAction SilentlyContinue)) {
+    try { $null = $line | ConvertFrom-Json -ErrorAction Stop; continue } catch { }
+    if (($line -replace '\x1b\[[0-9;]*m', '') -match '^\s*opencode run \[message') { return $true }
+  }
+  return $false
+}
+
+function Test-OpenCodeApiError($logPath) {
+  if (-not (Test-Path -LiteralPath $logPath)) { return $false }
+  foreach ($line in @(Get-Content -LiteralPath $logPath -Encoding UTF8)) {
+    try { $event = $line | ConvertFrom-Json -ErrorAction Stop } catch { continue }
+    if ($event.type -eq 'error' -and $null -ne $event.error) { return $true }
+  }
+  return $false
 }
 
 # Chi dung chuoi quota khi CLI/API bao het quota, rate limit hoac model khong
 # kha dung. Khong coi loi prompt/CLI la quota de tranh thu model khac vo ich.
-function Test-QuotaOrUnavailable($logPath) {
+function Test-QuotaOrUnavailable($logPath, $exitCode) {
   if (-not (Test-Path $logPath)) { return $false }
-  $text = Get-Content -Raw -Encoding UTF8 -Path $logPath -ErrorAction SilentlyContinue
-  return [bool]($text -match '(?im)(\bquota\b|rate[ -]?limit|usage[ -]?limit|too many requests|insufficient (credit|balance)|model .*\b(unavailable|not available)\b)')
+  $failurePattern = '(?i)(\bquota[ _-]*(exceeded|exhausted|limit|reached)\b|\b(exceeded|exhausted|insufficient)[ _-]*quota\b|\b(rate|usage)[ _-]*limit(ed|[ _-]*(exceeded|reached))?\b|too many requests|insufficient (credit|balance)|model .{0,100}\b(unavailable|not available)\b|\b429\b)'
+  foreach ($line in @(Get-Content -Encoding UTF8 -LiteralPath $logPath)) {
+    $line = $line -replace '\x1b\[[0-9;]*m', ''
+    $errorText = $null
+    try {
+      $event = $line | ConvertFrom-Json -ErrorAction Stop
+      # Never classify structured assistant text as an API failure.
+      if ($event.type -eq 'error') { $errorText = $event.error | ConvertTo-Json -Depth 20 -Compress }
+    } catch {
+      # Formatted CLI logs: require an actual failed invocation as well as
+      # an explicit error prefix. Ordinary prose mentioning quota is not enough.
+      if ($null -ne $exitCode -and $exitCode -ne 0 -and $line -match '^\s*(Error\b|APIError\b|ERROR\b|HTTP\s+429\b)') { $errorText = $line }
+    }
+    if ($errorText -and $errorText -match $failurePattern) { return $true }
+  }
+  return $false
 }
 
 function Invoke-OpenCode($modelId, $variantName, $logPath) {
   Sync-OpenCodeSession
   Assert-SessionRepo $Attach $Session | ForEach-Object { Write-Host $_ }
-  $ocArgs = @("run", "--auto", "--model", $modelId)
+  $ocArgs = @("run", "--auto", "--format", "json", "--model", $modelId)
   if ($variantName -ne "") { $ocArgs += @("--variant", $variantName) }
   if ($Attach  -ne "")     { $ocArgs += @("--attach", $Attach) }
   if ($Session -ne "")     { $ocArgs += @("--session", $Session) }
@@ -262,6 +328,7 @@ function Invoke-OpenCode($modelId, $variantName, $logPath) {
   $label = if ($variantName -ne "") { "$modelId (variant $variantName)" } else { $modelId }
   Write-Host "=> opencode $label | task=$base (stdin UTF-8) | log=$logPath"
   if ($Attach -ne "") { Write-Host "   xem live: $tuiHint" }
+  $beforeFingerprint = Get-WorktreeFingerprint
 
   $sw = [Diagnostics.Stopwatch]::StartNew()
   # Job tu ghi PID cua no ra file trong TEMP de cha biet duong giet ca cay khi
@@ -271,7 +338,8 @@ function Invoke-OpenCode($modelId, $variantName, $logPath) {
   # stdout+stderr -> file. Timeout bang job de khong treo session.
   $job = Start-Job -ScriptBlock {
     param($a, $l, $cwd, $pf, $exe, $task)
-    Set-Content -Path $pf -Value $PID
+    @{pid=$PID; started=(Get-Process -Id $PID).StartTime.ToUniversalTime().ToString('o')} |
+      ConvertTo-Json -Compress | Set-Content -LiteralPath $pf
     Set-Location $cwd
     # Windows PowerShell 5.1 mac dinh ghi ASCII vao native stdin; ep UTF-8
     # de brief tieng Viet va ky tu dac biet den OpenCode nguyen ven.
@@ -289,48 +357,72 @@ function Invoke-OpenCode($modelId, $variantName, $logPath) {
   } -ArgumentList $ocArgs, $logPath, $repo, $pidFile, $openCodePath, $taskFilePath
 
   if (-not (Wait-Job $job -Timeout $TimeoutSec)) {
+    $pendingPath = Join-Path $logDir 'opencode-pending.json'
+    $pending = @{ url=$Attach; session=$Session; repo=$repo; reason='timeout-unconfirmed'; created=(Get-Date).ToString('o'); clients=@() }
+    $pending | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $pendingPath -Encoding UTF8
     # Stop-Job chi giet job PowerShell, opencode.exe ma job de ra van song tiep.
     # Doc pid file, xac nhan dung job powershell (PID co the da bi cap lai cho
     # tien trinh khac), roi diet cay cac con cua no (opencode + con chau).
     # Khong taskkill thang vao job: job process bi giet cung lam PowerShell cho
     # them ~60s khi don job, trong khi diet con thi job tu ket thuc va script thoat ngay.
     $killedPid = $null
+    $clientStopped = $false
     if (Test-Path $pidFile) {
-      $rawPid = Get-Content -Path $pidFile -ErrorAction SilentlyContinue | Select-Object -First 1
+      $jobOwner = $null
+      try { $jobOwner = Get-Content -Raw -LiteralPath $pidFile | ConvertFrom-Json -ErrorAction Stop } catch { }
       $jobPid = 0
-      if ($rawPid -and [int]::TryParse(([string]$rawPid).Trim(), [ref]$jobPid)) {
+      if ($jobOwner -and [int]::TryParse([string]$jobOwner.pid, [ref]$jobPid)) {
         $jobProc = Get-Process -Id $jobPid -ErrorAction SilentlyContinue
-        if ($jobProc -and $jobProc.ProcessName -eq "powershell") {
+        if ($jobProc -and $jobProc.ProcessName -eq 'powershell' -and $jobOwner.started -and
+            $jobProc.StartTime.ToUniversalTime().ToString('o') -eq [string]$jobOwner.started) {
+          $clientStopped = $true
           $children = @(Get-CimInstance Win32_Process -Filter "ParentProcessId = $jobPid" -ErrorAction SilentlyContinue)
+          $pending.clients = @($children | ForEach-Object { @{pid=$_.ProcessId; started=$_.CreationDate} })
+          $pending | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $pendingPath -Encoding UTF8
           foreach ($c in $children) {
-            & taskkill.exe /PID $c.ProcessId /T /F | Out-Null
+            $killEap = $ErrorActionPreference
+            try { $ErrorActionPreference = 'Continue'; & taskkill.exe /PID $c.ProcessId /T /F 2>&1 | Out-Null; $killCode = $LASTEXITCODE }
+            finally { $ErrorActionPreference = $killEap }
+            if ($killCode -ne 0) { $clientStopped = $false }
             $killedPid = $c.ProcessId
           }
           if ($killedPid) {
             $waitStop = [Diagnostics.Stopwatch]::StartNew()
             while ((Get-Process -Id $killedPid -ErrorAction SilentlyContinue) -and $waitStop.Elapsed.TotalSeconds -lt 5) { Start-Sleep -Milliseconds 200 }
+            if (Get-Process -Id $killedPid -ErrorAction SilentlyContinue) { $clientStopped = $false }
           }
         }
       }
     }
-    Stop-Job $job -ErrorAction SilentlyContinue
+    # Stop the dispatching job before accepting server idle, otherwise it could
+    # submit a delayed prompt after abort. On kill denial keep the marker and
+    # still attempt server abort before potentially slow job cleanup.
+    if ($clientStopped) { Stop-Job $job -ErrorAction SilentlyContinue }
+    $serverStopped = Stop-OpenCodeSession $Attach $Session $repo
+    if (-not $clientStopped) { Stop-Job $job -ErrorAction SilentlyContinue }
     Remove-Job $job -Force -ErrorAction SilentlyContinue
     Remove-Item -Path $pidFile -Force -ErrorAction SilentlyContinue
+    if ($serverStopped -and $clientStopped) {
+      Remove-Item -LiteralPath $pendingPath -Force
+      Write-Host 'TIMEOUT: server da xac nhan dung session.'
+    } else {
+      Write-Host "BLOCKED: chua xac nhan dung ca client va session server; giu $pendingPath de chan ca hai lane."
+    }
     $sw.Stop()
     # Write-Host vi $r = Invoke-OpenCode gom het Write-Output cua ham vao ket qua,
     # khong hien ra console; dong TIMEOUT phai luon thay duoc.
-    if ($killedPid) {
+    if ($killedPid -and $clientStopped) {
       Write-Host "TIMEOUT sau ${TimeoutSec}s - da giet tien trinh $killedPid va cac con - xem log: $logPath"
     } else {
       Write-Host "TIMEOUT sau ${TimeoutSec}s - xem log: $logPath"
     }
-    return @{ code = 124; secs = [int]$sw.Elapsed.TotalSeconds; timedout = $true }
+    return @{ code = 124; secs = [int]$sw.Elapsed.TotalSeconds; timedout = $true; didWork = ((Get-WorktreeFingerprint) -ne $beforeFingerprint) }
   }
   $code = Receive-Job $job
   Remove-Job $job -Force
   Remove-Item -Path $pidFile -Force -ErrorAction SilentlyContinue
   $sw.Stop()
-  return @{ code = $code; secs = [int]$sw.Elapsed.TotalSeconds; timedout = $false }
+  return @{ code = $code; secs = [int]$sw.Elapsed.TotalSeconds; timedout = $false; didWork = ((Get-WorktreeFingerprint) -ne $beforeFingerprint) }
 }
 
 # ---------- luot chinh ----------
@@ -345,7 +437,7 @@ $changed   = & git status --porcelain
 # giu nguyen de review; timeout/loi tham so cung khong dem sang model tiep.
 $canFallback = (-not $changed) -and (-not $r.timedout) -and (-not $NoFallback) -and (-not (Test-ArgError $log))
 if ($canFallback) {
-  $quotaPath = Test-QuotaOrUnavailable $log
+  $quotaPath = Test-QuotaOrUnavailable $log $r.code
   $fallbackSequence = if ($quotaPath) { $quotaFallbacks } else { $noChangeFallbacks }
   $reason = if ($quotaPath) { "DeepSeek het quota/khong kha dung" } else { "luot truoc khong sinh thay doi" }
   $attempt = 0
@@ -368,19 +460,28 @@ $stat = & git diff --stat
 $testsRan    = $false
 $testsFailed = $false
 $testsTail   = @()
-if ($changed) {
+if ($changed -and -not $r.timedout) {
   if ($testCommand -ne "") {
     $prevEAP = $ErrorActionPreference
     $ErrorActionPreference = "Continue"
     try {
       # 2>&1 phai nam trong chuoi IEX: redirect ben ngoai khong bat duoc stderr cua lenh native.
       $LASTEXITCODE = 0
-      $testsText = (Invoke-Expression ($testCommand + " 2>&1") | Out-String)
+      $testOutput = @(Invoke-Expression ("& { " + $testCommand + "`n} 2>&1"))
+      $testsText = $testOutput | Out-String
       $testExitCode = $LASTEXITCODE
       $testsRan  = $true
       if ($testExitCode -ne 0) { $testsFailed = $true }
+      # Native stderr may be a harmless warning with exit 0. PowerShell errors
+      # are different: LASTEXITCODE remains 0 for Write-Error/missing commands.
+      foreach ($item in $testOutput) {
+        if ($item -is [Management.Automation.ErrorRecord] -and
+            $item.FullyQualifiedErrorId -notmatch '^NativeCommandError') { $testsFailed = $true }
+      }
     } catch {
-      $testsRan = $false
+      $testsRan = $true
+      $testsFailed = $true
+      $testsText = $_ | Out-String
     }
     $ErrorActionPreference = $prevEAP
   }
@@ -400,7 +501,9 @@ if ($changed) { Write-Output $changed } else { Write-Output "  (KHONG CO FILE NA
 Write-Output ""
 Write-Output "DIFFSTAT:"
 Write-Output $stat
-if ($changed) {
+if ($r.timedout) {
+  Write-Output 'TESTS: khong chay verify sau timeout; phai xac nhan coder da dung truoc.'
+} elseif ($changed) {
   Write-Output ""
   if ($testsRan) {
     Write-Output "TESTS:"
@@ -425,5 +528,13 @@ if (Test-ArgError $log) {
   Write-Output "ARGERROR: opencode in usage/help - prompt khong toi noi nguyen ven, KHONG phai model tu choi task"
   exit 7
 }
-if (-not $changed) { exit 5 }
+if ($null -eq $r.code -or $r.code -ne 0 -or (Test-OpenCodeApiError $log)) {
+  Write-Output "CODERERROR: OpenCode CLI/API that bai (CLI exit=$($r.code)); giu thay doi de review."
+  exit 7
+}
+if (-not $r.didWork) { exit 5 }
 exit 0
+} finally {
+  if ($runLockHandle) { $runLockHandle.Dispose() }
+  if ($pipelineGuard) { $pipelineGuard.Dispose() }
+}

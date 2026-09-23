@@ -6,6 +6,12 @@
 ## Việc cần làm
 <Cụ thể. Nêu tên hàm / endpoint / class thật. Không mô tả chung chung.>
 
+## Nếu đây là lượt sửa lỗi
+- Original brief: <đường dẫn bắt buộc đọc; ghi không áp dụng nếu là lượt đầu>
+- Baseline gốc: <commit>; tiến độ đã đạt: <...>; việc còn lại: <...>
+- Phát hiện: <file:dòng, hành vi sai, kỳ vọng>
+- Các mục phạm vi, luật và tiêu chí bên dưới vẫn phải đầy đủ vì session có thể được tạo mới.
+
 ## File được phép sửa
 - <path/to/file>
 - <path/to/test_file>
