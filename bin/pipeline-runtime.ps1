@@ -1,4 +1,36 @@
-# Shared safety primitives. Dot-source only; no processes or requests on load.
+# Shared OpenCode/API and pipeline safety helpers. Dot-source only; no requests
+# or processes are started on load.
+function Get-OpenCodeApiPrefix($baseUrl) {
+  if (-not $baseUrl) { return '' }
+  try {
+    $health = Invoke-RestMethod -Uri ($baseUrl.TrimEnd('/') + '/api/health') -TimeoutSec 3 -ErrorAction Stop
+    if ($health -and $health.healthy -eq $true -and $health.version) { return '/api' }
+  } catch { }
+  return ''
+}
+
+function Get-OpenCodeApiUri($baseUrl, $apiPrefix, $path) {
+  return ($baseUrl.TrimEnd('/') + $apiPrefix + '/' + ([string]$path).TrimStart('/'))
+}
+
+function Get-OpenCodeApiData($response, $apiPrefix) {
+  if ($apiPrefix -eq '/api' -and $response -and $response.PSObject.Properties['data']) {
+    return $response.data
+  }
+  return $response
+}
+
+function Get-OpenCodeSessionDirectory($sessionInfo, $apiPrefix) {
+  if (-not $sessionInfo) { return '' }
+  if ($apiPrefix -eq '/api') { return [string]$sessionInfo.location.directory }
+  return [string]$sessionInfo.directory
+}
+
+function Get-OpenCodeResumeCommand($url, $sessionId, $apiPrefix) {
+  if ($apiPrefix -eq '/api') { return "opencode --server $url --session $sessionId" }
+  return "opencode attach $url -s $sessionId"
+}
+
 function Enter-PipelineRun($repoRoot, $lane) {
   $logs = Join-Path $repoRoot '.pipeline\logs'
   $guard = [IO.File]::Open((Join-Path $logs 'pipeline-run.guard'), 'OpenOrCreate', 'ReadWrite', 'None')
@@ -35,13 +67,31 @@ function Enter-PipelineRun($repoRoot, $lane) {
 function Stop-OpenCodeSession($url, $sessionId, $repoRoot) {
   if (-not $url -or -not $sessionId) { return $false }
   $baseUrl = $url.TrimEnd('/')
+  $apiPrefix = Get-OpenCodeApiPrefix $baseUrl
   $query = '?directory=' + [uri]::EscapeDataString($repoRoot)
-  $sessionPath = $baseUrl + '/session/' + [uri]::EscapeDataString($sessionId)
+  $sessionPath = Get-OpenCodeApiUri $baseUrl $apiPrefix ('session/' + [uri]::EscapeDataString($sessionId))
   try {
     # Never abort a session in another repository.
-    $sessionInfo = Invoke-RestMethod -Uri ($sessionPath + $query) -TimeoutSec 4 -ErrorAction Stop
-    if ($sessionInfo.id -ne $sessionId -or -not $sessionInfo.directory -or
-        ([string]$sessionInfo.directory).Replace('/', '\').TrimEnd('\') -ine $repoRoot.Replace('/', '\').TrimEnd('\')) { return $false }
+    $sessionUri = if ($apiPrefix -eq '/api') { $sessionPath } else { $sessionPath + $query }
+    $sessionInfo = Get-OpenCodeApiData (Invoke-RestMethod -Uri $sessionUri -TimeoutSec 4 -ErrorAction Stop) $apiPrefix
+    $sessionDirectory = Get-OpenCodeSessionDirectory $sessionInfo $apiPrefix
+    if ([string]$sessionInfo.id -ne $sessionId -or -not $sessionDirectory -or
+        $sessionDirectory.Replace('/', '\').TrimEnd('\') -ine $repoRoot.Replace('/', '\').TrimEnd('\')) { return $false }
+
+    if ($apiPrefix -eq '/api') {
+      # V2 uses an interrupt endpoint that returns 204; activity is confirmed
+      # by polling the documented active-session map until this ID disappears.
+      $null = Invoke-RestMethod -Uri ($sessionPath + '/interrupt') -Method Post -TimeoutSec 4 -ErrorAction Stop
+      for ($attempt = 0; $attempt -lt 8; $attempt++) {
+        $activeResponse = Invoke-RestMethod -Uri (Get-OpenCodeApiUri $baseUrl $apiPrefix 'session/active') -TimeoutSec 4 -ErrorAction Stop
+        if (-not $activeResponse -or -not $activeResponse.PSObject.Properties['data'] -or
+            $activeResponse.data -isnot [pscustomobject]) { return $false }
+        if (-not $activeResponse.data.PSObject.Properties[$sessionId]) { return $true }
+        Start-Sleep -Milliseconds 250
+      }
+      return $false
+    }
+
     $ack = Invoke-RestMethod -Uri ($sessionPath + '/abort' + $query) -Method Post -TimeoutSec 4 -ErrorAction Stop
     if ($ack -isnot [bool] -or -not $ack) { return $false }
     # OpenCode omits idle sessions from its status map. Confirm the session

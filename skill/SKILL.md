@@ -36,7 +36,7 @@ backend thì làm đúng; nếu không, Claude chọn trong lúc plan và trình
 | Coder | Runner Claude | Script | Model |
 |---|---|---|---|
 | OpenCode | `oc-coder` | `.pipeline/bin/oc-run.ps1` | `deepseek-v4.1-flash` (`max`), fallback theo chuỗi policy |
-| Codex | `codex-coder` | `.pipeline/bin/codex-run.ps1` | `gpt-5.6-luna` + `xhigh`; leo thang `gpt-5.6-terra` + `high` |
+| Codex | `codex-coder` | `.pipeline/bin/codex-run.ps1` | `gpt-6-luna` + `xhigh`; leo thang `gpt-6-sol` + `high` |
 
 Để dùng backend Codex, máy chạy Claude phải có lệnh `codex` trong `PATH` và Codex
 CLI đã đăng nhập. Runner dùng authentication đã lưu của CLI, không đọc hoặc ghi API
@@ -51,11 +51,14 @@ nguyên để review; không thả coder thứ hai vào đè lên thay đổi. M
 
 | Lane | Mặc định | Leo thang |
 |---|---|---|
-| OpenCode | `opencode-go/deepseek-v4.1-flash` + `--variant max` | chuỗi fallback theo policy bên dưới |
-| Codex | `gpt-5.6-luna` + `model_reasoning_effort=xhigh` | `gpt-5.6-terra` + `model_reasoning_effort=high` |
+| OpenCode | `opencode-go/deepseek-v4.1-flash` + variant `max` | chuỗi fallback theo policy bên dưới |
+| Codex | `gpt-6-luna` + `model_reasoning_effort=xhigh` | `gpt-6-sol` + `model_reasoning_effort=high` |
 
-**Cấm dùng để implement code:** `gpt-5.6-sol` và `gpt-6-astra`, kể cả khi task khó; muốn
-dùng phải hỏi user trước. Runner `.pipeline/bin/codex-run.ps1` chặn cứng hai model này bằng `exit 2`.
+**Cấm dùng để implement code nếu chưa được duyệt:** `gpt-6-astra`. Runner
+`.pipeline/bin/codex-run.ps1` chặn cứng model này bằng `exit 2`. GPT-6 Luna là mặc định;
+GPT-6 Sol chỉ dùng khi leo thang theo chính sách và được user duyệt.
+Với OpenCode V2, runner ghép variant vào model theo dạng `provider/model#variant` và dùng
+`--server <URL>`; không tự thêm cờ V1 `--variant` hoặc `--attach` vào lệnh V2.
 
 Thang leo bậc khi review fail:
 
@@ -133,7 +136,7 @@ Với retry, state/brief sửa đổi là metadata cùng task đã biết; giữ
 powershell -NoProfile -File .pipeline/bin/oc-run.ps1 -TaskFile .pipeline/tasks/<id>.md
 ```
 
-Sau khi runner trả URL/session, luôn chuyển nguyên dòng `TUI: opencode attach <URL> -s <session-id>` cho người dùng. Với `-NoTui`, runner không mở CMD nhưng vẫn cấp session và in dòng này để người dùng tự mở lại TUI. `--auto` là cờ quyền tự duyệt, không phải chế độ hiển thị.
+Sau khi runner trả URL/session, luôn chuyển nguyên dòng `TUI:` cho người dùng. Runner tự chọn cú pháp theo API server: V1 là `opencode attach <URL> -s <session-id>`, V2 là `opencode --server <URL> --session <session-id>`. Với `-NoTui`, runner không mở CMD nhưng vẫn cấp session và in dòng này để người dùng tự mở lại TUI. `--auto` là cờ quyền tự duyệt, không phải chế độ hiển thị.
 
 Nó đóng cửa sổ CMD đang mở, rồi **tra bản đồ phiên Claude → phiên opencode**:
 
@@ -210,7 +213,7 @@ trong repo mới thì chạy một lượt `-Exec`/`-NoTui` nhỏ trong repo đ�
 đăng ký tin cậy), rồi hãy để mặc định. Thread liên thông hai chiều: thread do TUI tạo
 vẫn `codex exec resume <id>` được, và thread do `codex exec` tạo vẫn mở lại được bằng TUI.
 
-Runner tự ép model theo chính sách (`-Model gpt-5.6-luna`, `-ReasoningEffort xhigh`),
+Runner tự ép model theo chính sách (`-Model gpt-6-luna`, `-ReasoningEffort xhigh`),
 không phụ thuộc `~/.codex/config.toml` của máy nữa; chỉ đổi khi leo thang theo mục
 **Chính sách model** ở trên.
 
@@ -242,7 +245,7 @@ Lịch sử ID của cùng khóa Claude nằm trong `codex_sessions[]` tại
 Các field `codex_thread` / `opencode_session` chỉ session đang hoạt động. Không xóa
 map hoặc session cũ khi rollover; cả `-FreshSession` / `-FreshTui` cũng giữ lịch sử.
 Nội dung hội thoại do CLI lưu trên máy, còn map lưu liên kết để có thể mở lại bằng
-`codex resume <id>` hoặc `opencode attach <URL> -s <id>`.
+`codex resume <id>` hoặc lệnh OpenCode `TUI:` đã lưu (V1 `opencode attach`, V2 `opencode --server ... --session ...`).
 
 ### c) Review
 

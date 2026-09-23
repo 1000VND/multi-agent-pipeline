@@ -41,7 +41,7 @@ if (-not $pipelineConfig) {
 $cfgCodex = $null
 if ($pipelineConfig) { $cfgCodex = $pipelineConfig.model_policy.codex.default }
 if (($Model -eq "") -and $cfgCodex.model) { $Model = [string]$cfgCodex.model }
-if ($Model -eq "") { $Model = "gpt-5.6-luna" }
+if ($Model -eq "") { $Model = "gpt-6-luna" }
 if (($ReasoningEffort -eq "") -and $cfgCodex.reasoning_effort) { $ReasoningEffort = [string]$cfgCodex.reasoning_effort }
 if ($ReasoningEffort -eq "") { $ReasoningEffort = "xhigh" }
 if (($TimeoutSec -le 0) -and $pipelineConfig.timeout_sec) { $TimeoutSec = [int]$pipelineConfig.timeout_sec }
@@ -58,7 +58,7 @@ if ($pipelineConfig -and $null -ne $pipelineConfig.session_rollover.context_perc
 }
 
 # Model bi cam dung de implement code (co the ghi de trong pipeline.config.json).
-$forbiddenModels = @("gpt-5.6-sol", "gpt-6-astra")
+$forbiddenModels = @("gpt-6-astra")
 if ($pipelineConfig -and $pipelineConfig.model_policy.codex.forbidden) {
   $forbiddenModels = @($pipelineConfig.model_policy.codex.forbidden)
 }

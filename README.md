@@ -40,9 +40,10 @@ cd multi-agent-pipeline
 
 `<repo-dich>` phải là git repo (chạy `git init` trước nếu chưa). Install chạy lại được
 nhiều lần: lần sau cập nhật phần code, giữ nguyên `state.json` và các field riêng của
-`pipeline.config.json`. Schema fallback OpenCode được tự migrate và setting
-`session_rollover.context_percent` được bổ sung nếu chưa có. Thêm `-Force` nếu muốn đè cả file dữ liệu — khi đó install in rõ
-từng file bị đè.
+`pipeline.config.json`. Schema fallback OpenCode được tự migrate; Codex chỉ đổi từ
+GPT-5.6 Luna/Terra sang GPT-6 Luna/Sol khi config còn đúng các mặc định cũ. Policy đã
+tùy chỉnh được giữ nguyên. `session_rollover.context_percent` được bổ sung nếu chưa có.
+Thêm `-Force` nếu muốn đè cả file dữ liệu — khi đó install in rõ từng file bị đè.
 
 ### -NoGitTrack
 
@@ -117,11 +118,12 @@ chạy tiếp bằng mặc định built-in, không fail.
 
 | Lane | Mặc định | Leo thang |
 |---|---|---|
-| OpenCode | `opencode-go/deepseek-v4.1-flash` + `--variant max` | fallback theo chuỗi bên dưới |
-| Codex | `gpt-5.6-luna` + `model_reasoning_effort=xhigh` | `gpt-5.6-terra` + `model_reasoning_effort=high` |
+| OpenCode | `opencode-go/deepseek-v4.1-flash` + variant `max` | fallback theo chuỗi bên dưới |
+| Codex | `gpt-6-luna` + `model_reasoning_effort=xhigh` | `gpt-6-sol` + `model_reasoning_effort=high` |
 
-Cấm dùng `gpt-5.6-sol` và `gpt-6-astra` để implement code; runner Codex chặn cứng bằng
-`exit 2`. Thang leo bậc và luật worktree sạch nằm trong `SKILL.md`.
+Cấm dùng `gpt-6-astra` để implement code nếu chưa được user duyệt; runner Codex chặn cứng
+bằng `exit 2`. GPT-6 Luna là mặc định theo policy; GPT-6 Sol dành cho leo thang đã được
+duyệt. Thang leo bậc và luật worktree sạch nằm trong `SKILL.md`.
 
 ### Fallback OpenCode
 
@@ -234,10 +236,11 @@ ID cũ. Đây là danh bạ session, không phải bản sao lưu toàn bộ h�
 nằm trong kho session của Codex/OpenCode trên máy đó. Các file map được Git ignore,
 nên clone/pull repo sang máy khác không mang theo session của máy hiện tại.
 
-Mở lại một session cũ bằng `codex resume <thread-id>` hoặc
-`opencode attach <URL-server-của-repo> -s <session-id>`. Runner luôn in dòng `TUI:`
-của session được chọn. Chạy ngoài Claude Code cần truyền `-Key <tên-phiên>` cho cả hai
-runner để lịch sử được gắn đúng phiên.
+Mở lại một session cũ bằng `codex resume <thread-id>` hoặc dán nguyên lệnh `TUI:`
+mà runner in ra. OpenCode V1 dùng `opencode attach <URL> -s <session-id>`; V2 dùng
+`opencode --server <URL> --session <session-id>`. Runner tự nhận diện API của server.
+Chạy ngoài Claude Code cần truyền `-Key <tên-phiên>` cho cả hai runner để lịch sử
+được gắn đúng phiên.
 
 ## Mã thoát
 
@@ -260,9 +263,16 @@ runner để lịch sử được gắn đúng phiên.
 
 - Lane OpenCode tự tìm server riêng của từng repo trong dải cổng `4096-4105`, nên chạy
   nhiều repo song song thì mỗi repo chiếm một cổng trong dải đó.
-- Mỗi lượt OpenCode đều in `TUI: opencode attach <URL> -s <session-id>`. Kể cả khi dùng
+- Mỗi lượt OpenCode đều in lệnh `TUI:` phù hợp với phiên bản server. Kể cả khi dùng
   `-NoTui`, runner vẫn lấy/ghi session nhưng không mở CMD, để có thể dán lệnh này mở lại
   đúng TUI sau khi chạy headless hoặc lỡ đóng cửa sổ.
+
+OpenCode V2 dùng API `/api` và cờ `--server` để nối tới server; runner vẫn hỗ trợ V1.
+Với V2, model và variant được ghép theo dạng `provider/model#variant`; lệnh TUI thủ công
+dùng `opencode --server <URL> --session <id>`. Runner tự chuyển policy variant sang đúng
+cú pháp CLI của server, nên không thêm `--variant` thủ công vào lệnh V2.
+Đăng nhập OpenCode Go theo hướng dẫn trong Console: V2 dùng `opencode auth login opencode`,
+còn luồng V1 dùng `opencode console login`. Lệnh đăng nhập không chạy tự động khi cài skill.
 - Nội dung task brief được pipe vào standard input UTF-8, không nằm trong command line. Vì
   vậy brief dài hơn giới hạn 8,191 ký tự của `cmd.exe`, có tiếng Việt hoặc dấu nháy vẫn chạy
   được.
@@ -281,5 +291,6 @@ git pull
 Phần code trong `.pipeline/bin`, `.claude/agents`, `.claude/skills/pipeline` được copy đè;
 `state.json`, `PROJECT_RULES.md`, `tasks/_TEMPLATE.md` và `.pipeline/.gitignore` giữ
 nguyên trừ khi chạy `-Force`. `pipeline.config.json` giữ các field riêng của project,
-tự migrate hai chuỗi fallback OpenCode và thêm `session_rollover.context_percent: 80`
-nếu chưa có. Ngưỡng đã tùy chỉnh được giữ nguyên; không cần dùng `-Force` để nhận cập nhật này.
+tự migrate hai chuỗi fallback OpenCode, cập nhật policy Codex nếu nó vẫn mang mặc định
+GPT-5.6 cũ, và thêm `session_rollover.context_percent: 80` nếu chưa có. Ngưỡng/model đã
+tùy chỉnh được giữ nguyên; không cần dùng `-Force` để nhận cập nhật này.

@@ -26,6 +26,7 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
+$script:OpenCodeV2 = $false
 $fallbackOverrideRequested = $PSBoundParameters.ContainsKey("Fallback")
 $initialSession = $Session
 if ([string]::IsNullOrWhiteSpace($Key)) { $Key = $env:CLAUDE_CODE_HOST_SESSION_ID }
@@ -176,18 +177,28 @@ function Assert-SessionRepo($attachUrl, $sid) {
   }
   $dir      = $null
   $answered = $false
-  try {
-    $list     = Invoke-RestMethod -Uri "$attachUrl/session" -TimeoutSec 4 -ErrorAction Stop
-    $answered = $true
-    $hit = @($list) | Where-Object { $_.id -eq $sid } | Select-Object -First 1
-    if ($hit -and $hit.directory) { $dir = [string]$hit.directory }
-  } catch { }
-  if (-not $dir) {
+  $apiPrefix = Get-OpenCodeApiPrefix $attachUrl
+  if ($apiPrefix -eq '/api') {
     try {
-      $one      = Invoke-RestMethod -Uri "$attachUrl/session/$sid" -TimeoutSec 4 -ErrorAction Stop
+      $one      = Invoke-RestMethod -Uri (Get-OpenCodeApiUri $attachUrl $apiPrefix ('session/' + [uri]::EscapeDataString($sid))) -TimeoutSec 4 -ErrorAction Stop
       $answered = $true
-      if ($one -and $one.directory) { $dir = [string]$one.directory }
+      $one = Get-OpenCodeApiData $one $apiPrefix
+      $dir = Get-OpenCodeSessionDirectory $one $apiPrefix
     } catch { }
+  } else {
+    try {
+      $list     = Invoke-RestMethod -Uri "$attachUrl/session" -TimeoutSec 4 -ErrorAction Stop
+      $answered = $true
+      $hit = @($list) | Where-Object { $_.id -eq $sid } | Select-Object -First 1
+      if ($hit -and $hit.directory) { $dir = [string]$hit.directory }
+    } catch { }
+    if (-not $dir) {
+      try {
+        $one      = Invoke-RestMethod -Uri "$attachUrl/session/$sid" -TimeoutSec 4 -ErrorAction Stop
+        $answered = $true
+        if ($one -and $one.directory) { $dir = [string]$one.directory }
+      } catch { }
+    }
   }
   if (-not $dir) {
     if ($answered) {
@@ -228,7 +239,11 @@ function Sync-OpenCodeSession {
   if (-not $line -or -not $urlLine) { throw 'oc-tui.ps1 khong tra ve session/URL hop le.' }
   $script:Session = $line -replace "^SESSION=", ""
   $script:Attach = $urlLine -replace "^URL=", ""
-  $script:tuiHint = "opencode attach $($script:Attach) -s $($script:Session)"
+  $versionLine = $tui | Where-Object { $_ -match "^API_VERSION=" } | Select-Object -Last 1
+  $script:OpenCodeV2 = ($versionLine -eq 'API_VERSION=2')
+  $hintLine = $tui | Where-Object { $_ -match "^TUI: " } | Select-Object -Last 1
+  if ($hintLine) { $script:tuiHint = $hintLine -replace "^TUI: ", "" }
+  else { $script:tuiHint = Get-OpenCodeResumeCommand $script:Attach $script:Session $(if ($script:OpenCodeV2) { '/api' } else { '' }) }
   if ($NoTui -and $firstDispatch) { Write-Host "MODE: headless (khong mo cua so)" }
   # Print here as well for backwards-compatible helpers; host stream makes
   # the reconnect command visible while Invoke-OpenCode's result is captured.
@@ -319,9 +334,14 @@ function Test-QuotaOrUnavailable($logPath, $exitCode) {
 function Invoke-OpenCode($modelId, $variantName, $logPath) {
   Sync-OpenCodeSession
   Assert-SessionRepo $Attach $Session | ForEach-Object { Write-Host $_ }
-  $ocArgs = @("run", "--auto", "--format", "json", "--model", $modelId)
-  if ($variantName -ne "") { $ocArgs += @("--variant", $variantName) }
-  if ($Attach  -ne "")     { $ocArgs += @("--attach", $Attach) }
+  $modelArgument = $modelId
+  if ($script:OpenCodeV2 -and $variantName -ne "") { $modelArgument += "#$variantName" }
+  $ocArgs = @("run", "--auto", "--format", "json", "--model", $modelArgument)
+  if (-not $script:OpenCodeV2 -and $variantName -ne "") { $ocArgs += @("--variant", $variantName) }
+  if ($Attach -ne "") {
+    if ($script:OpenCodeV2) { $ocArgs += @("--server", $Attach) }
+    else { $ocArgs += @("--attach", $Attach) }
+  }
   if ($Session -ne "")     { $ocArgs += @("--session", $Session) }
   if ($Resume)             { $ocArgs += "--continue" }
 
@@ -344,7 +364,12 @@ function Invoke-OpenCode($modelId, $variantName, $logPath) {
     # Windows PowerShell 5.1 mac dinh ghi ASCII vao native stdin; ep UTF-8
     # de brief tieng Viet va ky tu dac biet den OpenCode nguyen ven.
     $previousOutputEncoding = $OutputEncoding
-    $OutputEncoding = New-Object System.Text.UTF8Encoding($false)
+    $previousConsoleOutputEncoding = [Console]::OutputEncoding
+    $utf8Encoding = New-Object System.Text.UTF8Encoding($false)
+    $OutputEncoding = $utf8Encoding
+    # PowerShell 5.1 decodes native stdout through Console.OutputEncoding.
+    # Keep logs intact when V2 emits UTF-8 JSON containing non-ASCII text.
+    [Console]::OutputEncoding = $utf8Encoding
     try {
       Get-Content -Raw -Encoding UTF8 -LiteralPath $task |
         & $exe @a *>&1 |
@@ -352,6 +377,7 @@ function Invoke-OpenCode($modelId, $variantName, $logPath) {
       $exitCode = $LASTEXITCODE
     } finally {
       $OutputEncoding = $previousOutputEncoding
+      [Console]::OutputEncoding = $previousConsoleOutputEncoding
     }
     $exitCode
   } -ArgumentList $ocArgs, $logPath, $repo, $pidFile, $openCodePath, $taskFilePath

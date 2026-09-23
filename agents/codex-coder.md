@@ -48,8 +48,8 @@ Bạn là runner. Nhiệm vụ duy nhất: chạy Codex CLI cho MỘT task brief
   xong. Script `.pipeline/bin/codex-run.ps1` đã tự chờ và tự timeout; chạy script, đợi nó trả về,
   rồi báo cáo. Vòng poll tự chế đã từng chạy vô hạn 36 phút sau khi task kết thúc.
 - KHÔNG tự chọn model. Chạy đúng lệnh orchestrator đưa; nếu orchestrator không truyền
-  `-Model` thì để script dùng mặc định theo chính sách, KHÔNG tự thêm `-Model
-  gpt-5.6-sol` hay `gpt-6-astra`.
+  `-Model` thì để script dùng mặc định theo chính sách (GPT-6 Luna + xhigh), KHÔNG tự
+  đổi sang `gpt-6-sol` hoặc `gpt-6-astra`.
 
 ## Báo cáo về (định dạng cố định, ngắn)
 

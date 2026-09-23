@@ -23,6 +23,7 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
+. (Join-Path $PSScriptRoot 'pipeline-runtime.ps1')
 $repo = (& git rev-parse --show-toplevel 2>$null)
 if (-not $repo) { Write-Error "Khong phai git repo."; exit 2 }
 
@@ -54,7 +55,11 @@ function Set-ObjectProperty($object, $name, $value) {
   if ($prop) { $prop.Value = $value } else { $object | Add-Member -NotePropertyName $name -NotePropertyValue $value }
 }
 function Test-Server {
-  try { Invoke-RestMethod -Uri "$Url/session" -TimeoutSec 4 -ErrorAction Stop | Out-Null; return $true }
+  try {
+    $prefix = Get-OpenCodeApiPrefix $Url
+    Invoke-RestMethod -Uri (Get-OpenCodeApiUri $Url $prefix 'session') -TimeoutSec 4 -ErrorAction Stop | Out-Null
+    return $true
+  }
   catch { return $false }
 }
 # Kho phien cua opencode dung chung toan may: hoi server cua repo A ve phien cua
@@ -64,9 +69,11 @@ function Test-Server {
 # directory thi chua biet (unknown = true), khong xoa lien ket vi loi mang.
 function Test-Session($sid) {
   $dir = $null
+  $prefix = Get-OpenCodeApiPrefix $Url
   try {
-    $one = Invoke-RestMethod -Uri "$Url/session/$sid" -TimeoutSec 6 -ErrorAction Stop
-    if ($one -and $one.directory) { $dir = [string]$one.directory }
+    $one = Invoke-RestMethod -Uri (Get-OpenCodeApiUri $Url $prefix ('session/' + [uri]::EscapeDataString($sid))) -TimeoutSec 6 -ErrorAction Stop
+    $one = Get-OpenCodeApiData $one $prefix
+    $dir = Get-OpenCodeSessionDirectory $one $prefix
   } catch {
     $statusCode = 0
     if ($_.Exception.Response -and $_.Exception.Response.StatusCode) {
@@ -85,11 +92,13 @@ function Normalize-RepoPath($p) {
 }
 # worktree cua server: $null = khong ket noi duoc, "" = co dich vu khac, con lai la duong dan.
 function Get-Worktree($baseUrl) {
+  $prefix = Get-OpenCodeApiPrefix $baseUrl
   try {
-    $proj = Invoke-RestMethod -Uri "$baseUrl/project/current" -TimeoutSec 3 -ErrorAction Stop
+    $proj = Invoke-RestMethod -Uri (Get-OpenCodeApiUri $baseUrl $prefix 'project/current') -TimeoutSec 3 -ErrorAction Stop
   } catch {
     return $null
   }
+  if ($prefix -eq '/api' -and $proj -and $proj.directory) { return [string]$proj.directory }
   if ($proj -and $proj.worktree) { return [string]$proj.worktree }
   return ""
 }
@@ -107,11 +116,19 @@ function Get-Number($object, $names) {
   }
   return 0L
 }
-function Get-ModelContextLimit($providers, $providerId, $modelId) {
+function Get-ModelContextLimit($modelCatalog, $providerId, $modelId, $apiPrefix) {
+  if ($apiPrefix -eq '/api') {
+    foreach ($model in @($modelCatalog.data)) {
+      if ([string]$model.providerID -cne $providerId) { continue }
+      $candidateId = if ($model.modelID) { [string]$model.modelID } else { [string]$model.id }
+      if ($candidateId -ceq $modelId) { return Get-Number $model.limit @("context") }
+    }
+    return 0L
+  }
   # GET /provider tra { all: Provider[], ... }. Hai provider co the co model
   # cung id nhung context khac nhau: chi dung dung cap providerID + modelID.
   if (-not $providerId -or -not $modelId) { return 0L }
-  foreach ($provider in @($providers.all)) {
+  foreach ($provider in @($modelCatalog.all)) {
     if ([string]$provider.id -cne $providerId) { continue }
     $property = $provider.models.PSObject.Properties[$modelId]
     if ($property -and $property.Value.limit) {
@@ -122,7 +139,12 @@ function Get-ModelContextLimit($providers, $providerId, $modelId) {
 }
 function Get-OpenCodeSessionContext($sid) {
   try {
-    $response = Invoke-RestMethod -Uri "$Url/session/$sid/message?limit=100" -TimeoutSec 8 -ErrorAction Stop
+    $prefix = $script:OpenCodeApiPrefix
+    if ($prefix -eq '/api') {
+      $response = Invoke-RestMethod -Uri (Get-OpenCodeApiUri $Url $prefix ('session/' + [uri]::EscapeDataString($sid) + '/context')) -TimeoutSec 8 -ErrorAction Stop
+    } else {
+      $response = Invoke-RestMethod -Uri "$Url/session/$sid/message?limit=100" -TimeoutSec 8 -ErrorAction Stop
+    }
     # On PowerShell 5.1, $array.missingProperty yields an array of nulls
     # whose boolean value is true. Detect envelopes on the object itself.
     $messages = if ($response -and $response.PSObject.Properties['data']) { @($response.data) }
@@ -133,9 +155,22 @@ function Get-OpenCodeSessionContext($sid) {
     # Server messages are oldest-first. Sort by created time too, so wrappers
     # returning newest-first cannot select stale usage. Ignore failed/empty
     # assistant placeholders and user messages (including compacted history).
-    $ordered = @($messages | Where-Object { $_.info.role -eq "assistant" } |
-      Sort-Object { Get-Number $_.info.time @("created") })
+    if ($prefix -eq '/api') {
+      $ordered = @($messages | Where-Object { $_.type -eq 'assistant' } |
+        Sort-Object { Get-Number $_.time @("created") })
+    } else {
+      $ordered = @($messages | Where-Object { $_.info.role -eq "assistant" } |
+        Sort-Object { Get-Number $_.info.time @("created") })
+    }
     foreach ($item in $ordered) {
+      if ($prefix -eq '/api') {
+        $tokens = $item.tokens
+        $current = (Get-Number $tokens @("input")) + (Get-Number $tokens.cache @("read")) +
+          (Get-Number $tokens.cache @("write")) + (Get-Number $tokens @("output")) +
+          (Get-Number $tokens @("reasoning"))
+        if ($current -gt 0) { $message = $item; $used = $current }
+        continue
+      }
       # A completed summary describes context BEFORE compaction. The next
       # ordinary request provides the new window usage; until then it is
       # unknown, not the old near-full value.
@@ -153,10 +188,16 @@ function Get-OpenCodeSessionContext($sid) {
       if ($current -gt 0) { $message = $item; $used = $current }
     }
     if (-not $message) { return $null }
-    $modelId = [string]$message.info.modelID
-    $providerId = [string]$message.info.providerID
-    try { $providers = Invoke-RestMethod -Uri "$Url/provider" -TimeoutSec 8 -ErrorAction Stop } catch { $providers = $null }
-    $window = Get-ModelContextLimit $providers $providerId $modelId
+    if ($prefix -eq '/api') {
+      $modelId = [string]$message.model.id
+      $providerId = [string]$message.model.providerID
+      try { $catalog = Invoke-RestMethod -Uri (Get-OpenCodeApiUri $Url $prefix 'model') -TimeoutSec 8 -ErrorAction Stop } catch { $catalog = $null }
+    } else {
+      $modelId = [string]$message.info.modelID
+      $providerId = [string]$message.info.providerID
+      try { $catalog = Invoke-RestMethod -Uri "$Url/provider" -TimeoutSec 8 -ErrorAction Stop } catch { $catalog = $null }
+    }
+    $window = Get-ModelContextLimit $catalog $providerId $modelId $prefix
     if ($used -le 0 -or $window -le 0) { return $null }
     return @{ used_tokens = [int64]$used; context_window = [int64]$window; percent = [math]::Round((100.0 * $used / $window), 1) }
   } catch {
@@ -204,7 +245,7 @@ function Retire-OpenCodeSession($table, $key, $sid, $reason, $context) {
   Set-ObjectProperty $entry[0] "retired_at" (Get-Date).ToString("s")
   Set-ObjectProperty $entry[0] "retired_reason" $reason
   if (-not $entry[0].url) { Set-ObjectProperty $entry[0] "url" $Url }
-  Set-ObjectProperty $entry[0] "resume_command" "opencode attach $($entry[0].url) -s $sid"
+  Set-ObjectProperty $entry[0] "resume_command" (Get-OpenCodeResumeCommand $entry[0].url $sid $script:OpenCodeApiPrefix)
   if ($context) {
     Set-ObjectProperty $entry[0] "last_context_tokens" ([int64]$context.used_tokens)
     Set-ObjectProperty $entry[0] "context_window_tokens" ([int64]$context.context_window)
@@ -338,6 +379,11 @@ if ($Url -ne "") {
   }
 }
 
+# One server can speak either the v1 routes or the v2 /api surface. The
+# detected version also determines the command we print for manual TUI resume.
+$script:OpenCodeApiPrefix = Get-OpenCodeApiPrefix $Url
+$script:OpenCodeVersion = if ($script:OpenCodeApiPrefix -eq '/api') { 2 } else { 1 }
+
 # ---------- 3. tra map: phien Claude -> phien opencode ----------
 # Serialize read/modify/write across runners so parallel Claude sessions do
 # not overwrite each other's associations. Atomic replacement keeps old JSON
@@ -415,7 +461,11 @@ try {
       $Title = "Claude $short - $(Get-Date -Format 'HH:mm')"
     }
     $body = @{ title = $Title } | ConvertTo-Json -Compress
-    $created = Invoke-RestMethod -Uri "$Url/session" -Method Post -Body $body -ContentType "application/json" -TimeoutSec 20
+    if ($script:OpenCodeApiPrefix -eq '/api') {
+      $body = @{ title = $Title; location = @{ directory = $repo } } | ConvertTo-Json -Compress
+    }
+    $created = Invoke-RestMethod -Uri (Get-OpenCodeApiUri $Url $script:OpenCodeApiPrefix 'session') -Method Post -Body $body -ContentType "application/json" -TimeoutSec 20
+    $created = Get-OpenCodeApiData $created $script:OpenCodeApiPrefix
     $sid = [string]$created.id
     if (-not $sid) { throw "Khong tao duoc session." }
     Write-Output "  TAO MOI phien opencode: $sid"
@@ -430,7 +480,7 @@ try {
   }
   Set-ObjectProperty $entry[0] "last_used" $now
   Set-ObjectProperty $entry[0] "url" $Url
-  Set-ObjectProperty $entry[0] "resume_command" "opencode attach $Url -s $sid"
+  Set-ObjectProperty $entry[0] "resume_command" (Get-OpenCodeResumeCommand $Url $sid $script:OpenCodeApiPrefix)
   if ($context -and $sid -eq $candidate) {
     Set-ObjectProperty $entry[0] "last_context_tokens" ([int64]$context.used_tokens)
     Set-ObjectProperty $entry[0] "context_window_tokens" ([int64]$context.context_window)
@@ -448,8 +498,9 @@ try {
 
 # ---------- 4. mo cua so CMD moi ----------
 if (-not $NoWindow) {
+  $resumeCommand = Get-OpenCodeResumeCommand $Url $sid $script:OpenCodeApiPrefix
   $proc = Start-Process -FilePath "cmd.exe" `
-            -ArgumentList @("/k", "title opencode $sid && opencode attach $Url -s $sid") `
+            -ArgumentList @("/k", "title opencode $sid && $resumeCommand") `
             -WorkingDirectory $repo -PassThru
 
   @{ pid = $proc.Id; sid = $sid; key = $Key; started = (Get-Date).ToString("s"); proc_started = (Get-OpenCodeProcessStart $proc) } |
@@ -461,4 +512,6 @@ if (-not $NoWindow) {
 }
 Write-Output "URL=$Url"
 Write-Output "SESSION=$sid"
-Write-Output "TUI: opencode attach $Url -s $sid"
+$resumeCommand = Get-OpenCodeResumeCommand $Url $sid $script:OpenCodeApiPrefix
+Write-Output "API_VERSION=$script:OpenCodeVersion"
+Write-Output "TUI: $resumeCommand"

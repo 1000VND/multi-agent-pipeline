@@ -89,7 +89,8 @@ function Get-CompactJson {
 
 # Nang schema fallback OpenCode va bo sung setting session con thieu:
 # giu nguyen project_name, test_command,
-# timeout, forbidden_paths, rules_docs va model Codex cua project dich.
+# timeout, forbidden_paths va rules_docs; chi migrate model Codex neu no van la
+# dung bo mac dinh cu, khong ghi de policy ma project da tuy chinh.
 function Migrate-PipelineConfig($dest, $templatePath) {
   try {
     $current = Get-Content -Raw -Encoding UTF8 $dest | ConvertFrom-Json
@@ -97,6 +98,9 @@ function Migrate-PipelineConfig($dest, $templatePath) {
     if ($current -isnot [pscustomobject]) { throw "Config must be a JSON object" }
     if ($current.model_policy -and $current.model_policy -isnot [pscustomobject]) { throw "model_policy must be a JSON object" }
     if ($current.model_policy.opencode -and $current.model_policy.opencode -isnot [pscustomobject]) { throw "model_policy.opencode must be a JSON object" }
+    if ($current.model_policy.codex -and $current.model_policy.codex -isnot [pscustomobject]) { throw "model_policy.codex must be a JSON object" }
+    if ($current.model_policy.codex.default -and $current.model_policy.codex.default -isnot [pscustomobject]) { throw "model_policy.codex.default must be a JSON object" }
+    if ($current.model_policy.codex.escalated -and $current.model_policy.codex.escalated -isnot [pscustomobject]) { throw "model_policy.codex.escalated must be a JSON object" }
     if ($null -ne $current.session_rollover -and $current.session_rollover -isnot [pscustomobject]) { throw "session_rollover must be a JSON object" }
   } catch {
     # Khong ghi warning vao success stream: chuoi canh bao + $false se thanh
@@ -134,6 +138,40 @@ function Migrate-PipelineConfig($dest, $templatePath) {
   }
   if (-not $targetPolicy.variant) {
     Set-JsonProperty -Object $targetPolicy -Name "variant" -Value $sourcePolicy.variant
+    $changed = $true
+  }
+
+  if (-not $current.model_policy.codex) {
+    Set-JsonProperty -Object $current.model_policy -Name "codex" -Value ([pscustomobject]@{})
+    $changed = $true
+  }
+  $targetCodex = $current.model_policy.codex
+  $sourceCodex = $template.model_policy.codex
+  foreach ($slot in @("default", "escalated")) {
+    if (-not $targetCodex.$slot) {
+      Set-JsonProperty -Object $targetCodex -Name $slot -Value ([pscustomobject]@{
+        model = [string]$sourceCodex.$slot.model
+        reasoning_effort = [string]$sourceCodex.$slot.reasoning_effort
+      })
+      $changed = $true
+      continue
+    }
+    $legacyModel = if ($slot -eq "default") { "gpt-5.6-luna" } else { "gpt-5.6-terra" }
+    if ([string]$targetCodex.$slot.model -eq $legacyModel) {
+      Set-JsonProperty -Object $targetCodex.$slot -Name "model" -Value ([string]$sourceCodex.$slot.model)
+      $changed = $true
+    }
+    if (-not $targetCodex.$slot.reasoning_effort) {
+      Set-JsonProperty -Object $targetCodex.$slot -Name "reasoning_effort" -Value ([string]$sourceCodex.$slot.reasoning_effort)
+      $changed = $true
+    }
+  }
+  $legacyForbidden = @("gpt-5.6-sol", "gpt-6-astra")
+  if (-not $targetCodex.PSObject.Properties["forbidden"]) {
+    Set-JsonProperty -Object $targetCodex -Name "forbidden" -Value @($sourceCodex.forbidden)
+    $changed = $true
+  } elseif ((@($targetCodex.forbidden) -join "|") -eq ($legacyForbidden -join "|")) {
+    Set-JsonProperty -Object $targetCodex -Name "forbidden" -Value @($sourceCodex.forbidden)
     $changed = $true
   }
 
@@ -185,7 +223,7 @@ foreach ($f in $dataFiles) {
   $dest = Join-Path $targetPath $f.Dst
   if ((Test-Path $dest) -and (-not $Force)) {
     if ($f.IsConfig -and (Migrate-PipelineConfig $dest $f.Src)) {
-      Write-Output "MIGRATE: $($f.Dst) (cap nhat policy fallback OpenCode/session, giu config du an)"
+      Write-Output "MIGRATE: $($f.Dst) (cap nhat policy OpenCode/Codex/session, giu config rieng cua du an)"
       continue
     }
     Write-Output "GIU NGUYEN: $($f.Dst) (da co, dung -Force neu muon de)"
