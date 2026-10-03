@@ -141,38 +141,42 @@ function Migrate-PipelineConfig($dest, $templatePath) {
     $changed = $true
   }
 
-  if (-not $current.model_policy.codex) {
-    Set-JsonProperty -Object $current.model_policy -Name "codex" -Value ([pscustomobject]@{})
-    $changed = $true
-  }
-  $targetCodex = $current.model_policy.codex
+  # Codex: project chua co policy thi nhan nguyen policy mau. Policy da co la
+  # du lieu rieng cua project: chi doi dung cac gia tri mac dinh cu (GPT-5.6/GPT-6 Luna),
+  # khong chen slot/field moi (vd escalated) vao policy da tuy chinh.
   $sourceCodex = $template.model_policy.codex
-  foreach ($slot in @("default", "escalated")) {
-    if (-not $targetCodex.$slot) {
-      Set-JsonProperty -Object $targetCodex -Name $slot -Value ([pscustomobject]@{
-        model = [string]$sourceCodex.$slot.model
-        reasoning_effort = [string]$sourceCodex.$slot.reasoning_effort
-      })
-      $changed = $true
-      continue
-    }
-    $legacyModel = if ($slot -eq "default") { "gpt-5.6-luna" } else { "gpt-5.6-terra" }
-    if ([string]$targetCodex.$slot.model -eq $legacyModel) {
-      Set-JsonProperty -Object $targetCodex.$slot -Name "model" -Value ([string]$sourceCodex.$slot.model)
-      $changed = $true
-    }
-    if (-not $targetCodex.$slot.reasoning_effort) {
-      Set-JsonProperty -Object $targetCodex.$slot -Name "reasoning_effort" -Value ([string]$sourceCodex.$slot.reasoning_effort)
-      $changed = $true
-    }
-  }
-  $legacyForbidden = @("gpt-5.6-sol", "gpt-6-astra")
-  if (-not $targetCodex.PSObject.Properties["forbidden"]) {
-    Set-JsonProperty -Object $targetCodex -Name "forbidden" -Value @($sourceCodex.forbidden)
+  if (-not $current.model_policy.codex) {
+    $forbidden = [System.Collections.Generic.List[object]]::new()
+    foreach ($model in @($sourceCodex.forbidden)) { $forbidden.Add([string]$model) }
+    Set-JsonProperty -Object $current.model_policy -Name "codex" -Value ([pscustomobject]@{
+      default = [pscustomobject]@{ model = [string]$sourceCodex.default.model; reasoning_effort = [string]$sourceCodex.default.reasoning_effort }
+      escalated = [pscustomobject]@{ model = [string]$sourceCodex.escalated.model; reasoning_effort = [string]$sourceCodex.escalated.reasoning_effort }
+      forbidden = $forbidden
+    })
     $changed = $true
-  } elseif ((@($targetCodex.forbidden) -join "|") -eq ($legacyForbidden -join "|")) {
-    Set-JsonProperty -Object $targetCodex -Name "forbidden" -Value @($sourceCodex.forbidden)
-    $changed = $true
+  } else {
+    $targetCodex = $current.model_policy.codex
+    foreach ($slot in @("default", "escalated")) {
+      $legacyModels = if ($slot -eq "default") { @("gpt-5.6-luna", "gpt-6-luna") } else { @("gpt-5.6-terra") }
+      if ($targetCodex.$slot -and [string]$targetCodex.$slot.model -in $legacyModels) {
+        Set-JsonProperty -Object $targetCodex.$slot -Name "model" -Value ([string]$sourceCodex.$slot.model)
+        if ($slot -eq "default" -and [string]$targetCodex.$slot.reasoning_effort -eq "xhigh") {
+          Set-JsonProperty -Object $targetCodex.$slot -Name "reasoning_effort" -Value ([string]$sourceCodex.$slot.reasoning_effort)
+        }
+        $changed = $true
+      }
+    }
+    $legacyForbidden = @("gpt-5.6-sol", "gpt-6-astra")
+    if ($targetCodex.PSObject.Properties["forbidden"] -and
+        (@($targetCodex.forbidden) -join "|") -eq ($legacyForbidden -join "|")) {
+      # Xoa roi Add-Member lai voi List: PS 5.1 co the serialise sai mang gan
+      # thang vao PSProperty.Value cua object tu ConvertFrom-Json.
+      $forbidden = [System.Collections.Generic.List[object]]::new()
+      foreach ($model in @($sourceCodex.forbidden)) { $forbidden.Add([string]$model) }
+      [void]$targetCodex.PSObject.Properties.Remove("forbidden")
+      $targetCodex | Add-Member -NotePropertyName "forbidden" -NotePropertyValue $forbidden
+      $changed = $true
+    }
   }
 
   $wantedNoChange = Get-CompactJson -Value $sourcePolicy.fallback_on_no_change
@@ -261,8 +265,13 @@ if ($NoGitTrack) {
 }
 
 # 5. Bao cao dieu kien chay (thieu thi khong fail).
-function Show-ToolStatus($name) {
-  $cmd = Get-Command $name -ErrorAction SilentlyContinue
+# Runner khong goi duoc shim .ps1 cua npm: bao dung file ma runner se chay
+# (codex: .exe/.cmd/.bat/.com dau tien trong PATH; opencode: opencode.cmd).
+function Find-RunnerTool($name, [string[]]$Extensions) {
+  return (Get-Command $name -CommandType Application -All -ErrorAction SilentlyContinue |
+    Where-Object { $_.Extension -in $Extensions } | Select-Object -First 1)
+}
+function Show-ToolStatus($name, $cmd) {
   if ($cmd) {
     Write-Output "OK    $name -> $($cmd.Source)"
   } else {
@@ -272,21 +281,23 @@ function Show-ToolStatus($name) {
 
 Write-Output ""
 Write-Output "== DIEU KIEN CHAY =="
-Show-ToolStatus "git"
+Show-ToolStatus "git" (Get-Command git -ErrorAction SilentlyContinue)
 $psv = $PSVersionTable.PSVersion
 if ($psv.Major -eq 5 -and $psv.Minor -eq 1) {
   Write-Output "OK    Windows PowerShell $psv"
 } else {
   Write-Output "CANH BAO PowerShell $psv - pipeline viet cho Windows PowerShell 5.1"
 }
-Show-ToolStatus "codex"
-Show-ToolStatus "opencode"
-Show-ToolStatus "python"
-if (-not (Get-Command codex -ErrorAction SilentlyContinue)) {
-  Write-Output "CANH BAO: thieu codex - lane Codex se khong dung duoc."
+$codexTool = Find-RunnerTool "codex" @('.exe', '.cmd', '.bat', '.com')
+$openCodeTool = Find-RunnerTool "opencode" @('.cmd')
+Show-ToolStatus "codex" $codexTool
+Show-ToolStatus "opencode" $openCodeTool
+Show-ToolStatus "python" (Get-Command python -ErrorAction SilentlyContinue)
+if (-not $codexTool) {
+  Write-Output "CANH BAO: thieu codex (.exe/.cmd) - lane Codex se khong dung duoc."
 }
-if (-not (Get-Command opencode -ErrorAction SilentlyContinue)) {
-  Write-Output "CANH BAO: thieu opencode - lane OpenCode se khong dung duoc."
+if (-not $openCodeTool) {
+  Write-Output "CANH BAO: thieu opencode.cmd - lane OpenCode se khong dung duoc."
 }
 
 # 6. Viec can lam tiep.

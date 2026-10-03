@@ -54,7 +54,8 @@ class FakeCodex {
             File.WriteAllText(Path.Combine(sessionsRoot, "session-fake.jsonl"), rollout);
         }
         if (Environment.GetEnvironmentVariable("FAKE_CODEX_SLEEP") == "1") { Thread.Sleep(60000); }
-        return 0;
+        int exitCode;
+        return int.TryParse(Environment.GetEnvironmentVariable("FAKE_CODEX_EXIT"), out exitCode) ? exitCode : 0;
     }
 }
 '@
@@ -171,7 +172,9 @@ function Invoke-Runner {
     [string]$WorkingDirectory = '',
     [switch]$Touch,
     [string]$CodexHome = "",
-    [switch]$WriteRollout
+    [switch]$WriteRollout,
+    [int]$ExitCode = 0,
+    [string]$FakeDir = ""
   )
   $saved = @{
     PATH = $env:PATH
@@ -180,15 +183,17 @@ function Invoke-Runner {
     THREAD = $env:FAKE_CODEX_THREAD
     SLEEP = $env:FAKE_CODEX_SLEEP
     TOUCH = $env:FAKE_CODEX_TOUCH
+    EXIT = $env:FAKE_CODEX_EXIT
     CODEX_HOME = $env:CODEX_HOME
     SESSIONS_ROOT = $env:FAKE_CODEX_SESSIONS_ROOT
   }
-  $env:PATH = "$($Sandbox.fake);$($saved.PATH)"
+  $env:PATH = "$(if ($FakeDir) { $FakeDir } else { $Sandbox.fake });$($saved.PATH)"
   $env:CLAUDE_CODE_HOST_SESSION_ID = $null
   $env:CLAUDE_CODE_SESSION_ID = $null
   $env:FAKE_CODEX_THREAD = $null
   $env:FAKE_CODEX_SLEEP = $null
   $env:FAKE_CODEX_TOUCH = $null
+  $env:FAKE_CODEX_EXIT = if ($ExitCode) { [string]$ExitCode } else { $null }
   # Tuyet doi khong fallback sang rollout that trong USERPROFILE khi test.
   $env:CODEX_HOME = $Sandbox.codexHome
   $env:FAKE_CODEX_SESSIONS_ROOT = $null
@@ -248,6 +253,7 @@ function Invoke-Runner {
     $env:FAKE_CODEX_THREAD = $saved.THREAD
     $env:FAKE_CODEX_SLEEP = $saved.SLEEP
     $env:FAKE_CODEX_TOUCH = $saved.TOUCH
+    $env:FAKE_CODEX_EXIT = $saved.EXIT
     $env:CODEX_HOME = $saved.CODEX_HOME
     $env:FAKE_CODEX_SESSIONS_ROOT = $saved.SESSIONS_ROOT
   }
@@ -316,6 +322,20 @@ function Set-TuiRecord($sandbox, $pidValue, $procStarted) {
   if ($procStarted) { $record.proc_started = [string]$procStarted }
   $map = @{ "__pipeline_tui__" = $record }
   $map | ConvertTo-Json -Depth 5 | Set-Content -Path (Join-Path $sandbox.repo ".pipeline\codex-map.json") -Encoding UTF8
+}
+
+# Merge a managed TUI record into the current map (keeps thread associations).
+function Add-TuiRecord($sandbox, $pidValue, $procStarted, [string]$SessionKey = "seed", [string]$ProcName = "") {
+  $mapPath = Join-Path $sandbox.repo ".pipeline\codex-map.json"
+  $map = @{}
+  if (Test-Path -LiteralPath $mapPath) {
+    (Get-Content -Raw -LiteralPath $mapPath | ConvertFrom-Json).PSObject.Properties | ForEach-Object { $map[$_.Name] = $_.Value }
+  }
+  $record = @{ pid = [int]$pidValue; session_key = $SessionKey; started = (Get-Date).ToString("s") }
+  if ($procStarted) { $record.proc_started = [string]$procStarted }
+  if ($ProcName) { $record.proc_name = $ProcName }
+  $map["__pipeline_tui__"] = $record
+  $map | ConvertTo-Json -Depth 20 | Set-Content -LiteralPath $mapPath -Encoding UTF8
 }
 
 function Start-FakeVictim($sandbox) {
@@ -740,8 +760,93 @@ Describe "codex-run headless command path" {
     $calls = @(Get-FakeCalls $sandbox)
     $calls.Count | Should Be 2
     (Get-CallArgs $calls[0]) | Should Match "^exec\|--json\|--approve-for-me\|--cd\|"
-    (Get-CallArgs $calls[1]) | Should Match "^exec\|resume\|--json\|"
+    (Get-CallArgs $calls[0]) | Should Match '\|--model\|gpt-6\.1-sol\|--config\|model_reasoning_effort=high\|'
+    # `exec resume` rejects --approve-for-me/--cd after the subcommand; they go
+    # before it so the resumed turn keeps the workspace-write sandbox.
+    (Get-CallArgs $calls[1]) | Should Match "^exec\|--approve-for-me\|--cd\|[^|]+\|resume\|--json\|"
+    (Get-CallArgs $calls[1]) | Should Match '\|--model\|gpt-6\.1-sol\|--config\|model_reasoning_effort=high\|'
     (Get-CallArgs $calls[1]) | Should Match "\|thread-args\|-$"
+  }
+}
+
+Describe "codex-run exit status and executable regressions" {
+  BeforeEach { $sandbox = New-Sandbox }
+  AfterEach { Remove-Sandbox $sandbox }
+
+  It "returns 7 but keeps the edits when headless Codex fails after editing" {
+    $r = Invoke-Runner -Sandbox $sandbox -Key 'fail-key' -NoTui -Touch -ExitCode 3
+    $r.code | Should Be 7
+    $r.text | Should Match 'CODEXERROR: codex thoat voi ma 3'
+    (Test-Path (Join-Path $sandbox.repo 'fake-change.txt')) | Should Be $true
+  }
+
+  It "reports a no-op resume as no change even when verification fails" {
+    Set-TestCommand $sandbox "cmd.exe /d /c exit 1"
+    Set-Content (Join-Path $sandbox.repo 'fake-change.txt') 'previous attempt'
+    $r = Invoke-Runner $sandbox -Key medium -Session fixture -NoTui -Resume
+    $r.code | Should Be 5
+    $r.text | Should Match 'TESTS: bo qua'
+  }
+
+  It "still fails verification when a resume makes new edits" {
+    Set-TestCommand $sandbox "cmd.exe /d /c exit 1"
+    Set-Content (Join-Path $sandbox.repo 'fake-change.txt') 'previous attempt'
+    (Invoke-Runner $sandbox -Key medium -Session fixture -NoTui -Resume -Touch).code | Should Be 8
+  }
+
+  It "uses the npm codex.cmd shim instead of the codex.ps1 that PowerShell prefers" {
+    $npm = Join-Path $sandbox.root 'npm'
+    New-Item -ItemType Directory -Force -Path $npm | Out-Null
+    Set-Content -LiteralPath (Join-Path $npm 'codex.ps1') -Value 'throw "codex.ps1 must never be launched"'
+    Set-Content -LiteralPath (Join-Path $npm 'codex.cmd') -Value ('@"' + (Join-Path $sandbox.fake 'codex.exe') + '" %*') -Encoding ASCII
+    $r = Invoke-Runner -Sandbox $sandbox -Key 'npm-key' -Thread 'thread-npm' -NoTui -FakeDir $npm
+    $r.code | Should Be 5
+    @(Get-FakeCalls $sandbox).Count | Should Be 1
+    (Get-Map $sandbox).'npm-key'.codex_thread | Should Be 'thread-npm'
+  }
+
+  It "closes a managed TUI recorded under its real process name, such as a cmd shim" {
+    $victim = Start-Process -FilePath "powershell.exe" -ArgumentList @("-NoProfile", "-Command", "Start-Sleep -Seconds 60") -PassThru -WindowStyle Hidden
+    try {
+      $started = $null
+      $deadline = (Get-Date).AddSeconds(10)
+      while (-not $started -and (Get-Date) -lt $deadline) {
+        try { $started = $victim.StartTime.ToUniversalTime().ToString("o") } catch { Start-Sleep -Milliseconds 100 }
+      }
+      Add-TuiRecord $sandbox $victim.Id $started -ProcName 'powershell'
+      $r = Invoke-Runner -Sandbox $sandbox -Key "tui-key" -TimeoutSec 2
+      # The fake taskkill denies the kill, so the runner must refuse to open another TUI.
+      $r.code | Should Be 10
+      (Get-Content -LiteralPath (Join-Path $sandbox.fake "taskkill-calls.txt")) | Should Be "/PID|$($victim.Id)|/T|/F"
+    } finally { Stop-Process -Id $victim.Id -Force -ErrorAction SilentlyContinue }
+  }
+
+  It "closes this Claude session's managed TUI before a headless resume, but not another session's" {
+    [void](Invoke-Runner -Sandbox $sandbox -Key "resume-key" -Thread "thread-resume" -NoTui)
+    $victim = Start-FakeVictim $sandbox
+    try {
+      $victim.started | Should Not BeNullOrEmpty
+      Add-TuiRecord $sandbox $victim.proc.Id $victim.started -SessionKey "other-key"
+      (Invoke-Runner -Sandbox $sandbox -Key "resume-key" -NoTui).code | Should Be 5
+      (Test-Path (Join-Path $sandbox.fake "taskkill-calls.txt")) | Should Be $false
+
+      Add-TuiRecord $sandbox $victim.proc.Id $victim.started -SessionKey "resume-key"
+      $r = Invoke-Runner -Sandbox $sandbox -Key "resume-key" -NoTui
+      $r.code | Should Be 10
+      $r.text | Should Match "BLOCKED: khong dong duoc TUI Codex cu"
+      (Get-Content -LiteralPath (Join-Path $sandbox.fake "taskkill-calls.txt")) | Should Be "/PID|$($victim.proc.Id)|/T|/F"
+    } finally { Stop-FakeProcess $victim.proc }
+  }
+
+  It "exits 2 with a clear message outside a git repository" {
+    $outside = Join-Path $sandbox.root 'outside'
+    New-Item -ItemType Directory -Path $outside | Out-Null
+    $savedCeiling = $env:GIT_CEILING_DIRECTORIES
+    $env:GIT_CEILING_DIRECTORIES = $sandbox.root
+    try { $r = Invoke-Runner $sandbox -Key outside -NoTui -WorkingDirectory $outside }
+    finally { $env:GIT_CEILING_DIRECTORIES = $savedCeiling }
+    $r.code | Should Be 2
+    $r.text | Should Match 'Khong phai git repo'
   }
 }
 

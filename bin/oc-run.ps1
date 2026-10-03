@@ -35,7 +35,10 @@ if ([string]::IsNullOrWhiteSpace($Key)) {
   Write-Output "BLOCKED: khong co CLAUDE_CODE_*_SESSION_ID. Truyen -Key <claude-session-id> de tranh lan lich su."
   exit 11
 }
+# PS 5.1 turns redirected native stderr into a terminating error under Stop.
+$ErrorActionPreference = "Continue"
 $repo = (& git rev-parse --show-toplevel 2>$null)
+$ErrorActionPreference = "Stop"
 if (-not $repo) { Write-Output "Khong phai git repo. Pipeline nay bat buoc dung git."; exit 2 }
 
 # Doc cau hinh pipeline cua repo. Uu tien: tham so dong lenh > config > mac dinh built-in.
@@ -130,27 +133,12 @@ try {
 }
 try {
 
-# Compare content, not just porcelain: a resumed task may modify a file that
-# was already dirty. Git supplies NUL-separated paths, including untracked files.
-function Get-WorktreeFingerprint {
-  $rawPaths = (& git -C $repo -c core.quotepath=false ls-files -z --modified --deleted --others --exclude-standard) -join "`n"
-  if ($LASTEXITCODE -ne 0) { throw 'Cannot snapshot worktree paths.' }
-  $stagedPaths = (& git -C $repo -c core.quotepath=false diff --cached --name-only -z) -join "`n"
-  if ($LASTEXITCODE -ne 0) { throw 'Cannot snapshot index paths.' }
-  $rawPaths += "`0" + $stagedPaths
-  $entries = foreach ($relative in @($rawPaths -split "`0" | Where-Object { $_ } | Sort-Object -Unique)) {
-    $path = Join-Path $repo $relative
-    if (Test-Path -LiteralPath $path -PathType Leaf) {
-      '{0}:{1}' -f $relative, (Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash
-    } elseif (Test-Path -LiteralPath $path -PathType Container) {
-      # A tracked submodule is a directory, not a file.
-      '{0}:submodule:{1}:{2}' -f $relative, ((& git -C $path rev-parse HEAD) -join ''), ((& git -C $path status --porcelain) -join "`n")
-    } else { '{0}:deleted' -f $relative }
-  }
-  $indexState = (& git -C $repo diff --cached --raw --no-abbrev) -join "`n"
-  if ($LASTEXITCODE -ne 0) { throw 'Cannot snapshot index state.' }
-  return (($entries -join "`n") + "`nINDEX:`n" + $indexState)
-}
+# OpenCode V2 servers require Basic auth: API calls send it, and the opencode
+# client started for each dispatch gets the same password via env.
+$openCodeAuth = Initialize-OpenCodeAuth $repo
+
+# Content fingerprint shared with codex-run (see pipeline-runtime.ps1).
+function Get-WorktreeFingerprint { Get-PipelineWorktreeFingerprint $repo }
 
 # Bat buoc worktree sach truoc khi giao viec -> git diff sau do = dung
 # phan opencode vua lam, khong lan voi thay doi cu.
@@ -180,21 +168,21 @@ function Assert-SessionRepo($attachUrl, $sid) {
   $apiPrefix = Get-OpenCodeApiPrefix $attachUrl
   if ($apiPrefix -eq '/api') {
     try {
-      $one      = Invoke-RestMethod -Uri (Get-OpenCodeApiUri $attachUrl $apiPrefix ('session/' + [uri]::EscapeDataString($sid))) -TimeoutSec 4 -ErrorAction Stop
+      $one      = Invoke-OpenCodeApi -Uri (Get-OpenCodeApiUri $attachUrl $apiPrefix ('session/' + [uri]::EscapeDataString($sid))) -TimeoutSec 4
       $answered = $true
       $one = Get-OpenCodeApiData $one $apiPrefix
       $dir = Get-OpenCodeSessionDirectory $one $apiPrefix
     } catch { }
   } else {
     try {
-      $list     = Invoke-RestMethod -Uri "$attachUrl/session" -TimeoutSec 4 -ErrorAction Stop
+      $list     = Invoke-OpenCodeApi -Uri "$attachUrl/session" -TimeoutSec 4
       $answered = $true
       $hit = @($list) | Where-Object { $_.id -eq $sid } | Select-Object -First 1
       if ($hit -and $hit.directory) { $dir = [string]$hit.directory }
     } catch { }
     if (-not $dir) {
       try {
-        $one      = Invoke-RestMethod -Uri "$attachUrl/session/$sid" -TimeoutSec 4 -ErrorAction Stop
+        $one      = Invoke-OpenCodeApi -Uri "$attachUrl/session/$sid" -TimeoutSec 4
         $answered = $true
         if ($one -and $one.directory) { $dir = [string]$one.directory }
       } catch { }
@@ -222,6 +210,13 @@ if (($Attach -ne "") -and ($Session -ne "")) { Assert-SessionRepo $Attach $Sessi
 # an in-flight model request. Fresh/explicit Session applies only to the first
 # dispatch, so fallback follows the newly active session after rollover.
 $dispatchCount = 0
+# oc-tui: 4 = no usable server for this repo, 10 = managed TUI could not be
+# closed. Any other failure means no session was produced: documented exit 6.
+function Exit-OpenCodeTuiFailure($tuiCode) {
+  if ($tuiCode -in @(4, 10)) { Write-Host "BLOCKED: oc-tui.ps1 exit=$tuiCode"; exit $tuiCode }
+  Write-Host "BLOCKED: oc-tui.ps1 khong tra ve session/URL hop le (exit=$tuiCode)."
+  exit 6
+}
 function Sync-OpenCodeSession {
   $oldSession = $script:Session
   $firstDispatch = $script:dispatchCount -eq 0
@@ -235,8 +230,7 @@ function Sync-OpenCodeSession {
   $tui | ForEach-Object { Write-Host $_ }
   $line = $tui | Where-Object { $_ -match "^SESSION=" } | Select-Object -Last 1
   $urlLine = $tui | Where-Object { $_ -match "^URL=" } | Select-Object -Last 1
-  if ($tuiCode -ne 0) { Write-Host "BLOCKED: oc-tui.ps1 exit=$tuiCode"; exit $tuiCode }
-  if (-not $line -or -not $urlLine) { throw 'oc-tui.ps1 khong tra ve session/URL hop le.' }
+  if ($tuiCode -ne 0 -or -not $line -or -not $urlLine) { Exit-OpenCodeTuiFailure $tuiCode }
   $script:Session = $line -replace "^SESSION=", ""
   $script:Attach = $urlLine -replace "^URL=", ""
   $versionLine = $tui | Where-Object { $_ -match "^API_VERSION=" } | Select-Object -Last 1
@@ -248,11 +242,13 @@ function Sync-OpenCodeSession {
   # Print here as well for backwards-compatible helpers; host stream makes
   # the reconnect command visible while Invoke-OpenCode's result is captured.
   Write-Host "TUI: $($script:tuiHint)"
+  $authLine = $tui | Where-Object { $_ -match "^TUI_AUTH: " } | Select-Object -Last 1
+  if ($authLine) { Write-Host $authLine }
   if (-not $NoTui -and -not $firstDispatch -and $oldSession -ne $script:Session) {
     # User chose TUI: move the visible window to the replacement session too.
     & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $PSScriptRoot "oc-tui.ps1") `
       -Key $Key -Url $script:Attach -Session $script:Session | ForEach-Object { Write-Host $_ }
-    if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+    if ($LASTEXITCODE -ne 0) { Exit-OpenCodeTuiFailure $LASTEXITCODE }
   }
   $script:dispatchCount++
 }
@@ -291,11 +287,27 @@ if ($OpenCodeCmd -ne "") {
 Write-Output "CLI: $openCodePath"
 
 # opencode in usage/help khi prompt khong toi noi nguyen ven -> nhan dien de khong dot fallback.
+# V1 in "opencode run [message..]"; V2 in "opencode run [flags]" hoac loi flag,
+# co the kem tien to "<lenh> : " khi PowerShell ghi stderr vao log.
 function Test-ArgError($logPath) {
   if (-not (Test-Path $logPath)) { return $false }
-  foreach ($line in @(Get-Content -Path $logPath -TotalCount 5 -ErrorAction SilentlyContinue)) {
+  foreach ($line in @(Get-Content -Path $logPath -TotalCount 20 -ErrorAction SilentlyContinue)) {
     try { $null = $line | ConvertFrom-Json -ErrorAction Stop; continue } catch { }
-    if (($line -replace '\x1b\[[0-9;]*m', '') -match '^\s*opencode run \[message') { return $true }
+    $plain = $line -replace '\x1b\[[0-9;]*m', ''
+    if ($plain -match '^\s*opencode run \[(message|flags\])') { return $true }
+    if ($plain -match '^\s*(\S+\s+:\s+)?(Unrecognized flag:|Missing value for flag --|Invalid value for flag --)') { return $true }
+  }
+  return $false
+}
+
+# V2 CLI khong ket noi/xac thuc duoc server: doi model cung vo ich.
+function Test-ServerSetupError($logPath) {
+  if (-not (Test-Path -LiteralPath $logPath)) { return $false }
+  $pattern = 'requires a password; set OPENCODE_PASSWORD|rejected the password|Could not reach server at|did not provide a compatible V2 health response'
+  foreach ($line in @(Get-Content -LiteralPath $logPath -Encoding UTF8)) {
+    if ($line -notmatch $pattern) { continue }
+    # Never classify structured assistant text quoting these messages.
+    try { $null = $line | ConvertFrom-Json -ErrorAction Stop } catch { return $true }
   }
   return $false
 }
@@ -357,10 +369,13 @@ function Invoke-OpenCode($modelId, $variantName, $logPath) {
   $pidFile = Join-Path $env:TEMP ("oc-run-{0}-{1}.pid" -f $Tag, [guid]::NewGuid().ToString("N").Substring(0, 8))
   # stdout+stderr -> file. Timeout bang job de khong treo session.
   $job = Start-Job -ScriptBlock {
-    param($a, $l, $cwd, $pf, $exe, $task)
+    param($a, $l, $cwd, $pf, $exe, $task, $pw)
     @{pid=$PID; started=(Get-Process -Id $PID).StartTime.ToUniversalTime().ToString('o')} |
       ConvertTo-Json -Compress | Set-Content -LiteralPath $pf
     Set-Location $cwd
+    # OpenCode V2 client authenticates to --server with this variable; it is
+    # passed to the job privately, not on any command line.
+    if ($pw) { $env:OPENCODE_PASSWORD = $pw }
     # Windows PowerShell 5.1 mac dinh ghi ASCII vao native stdin; ep UTF-8
     # de brief tieng Viet va ky tu dac biet den OpenCode nguyen ven.
     $previousOutputEncoding = $OutputEncoding
@@ -380,7 +395,7 @@ function Invoke-OpenCode($modelId, $variantName, $logPath) {
       [Console]::OutputEncoding = $previousConsoleOutputEncoding
     }
     $exitCode
-  } -ArgumentList $ocArgs, $logPath, $repo, $pidFile, $openCodePath, $taskFilePath
+  } -ArgumentList $ocArgs, $logPath, $repo, $pidFile, $openCodePath, $taskFilePath, $openCodeAuth.password
 
   if (-not (Wait-Job $job -Timeout $TimeoutSec)) {
     $pendingPath = Join-Path $logDir 'opencode-pending.json'
@@ -460,8 +475,10 @@ $changed   = & git status --porcelain
 
 # ---------- fallback ----------
 # Chi fallback khi luot truoc KHONG dong vao file nao. Neu da sua do dang thi
-# giu nguyen de review; timeout/loi tham so cung khong dem sang model tiep.
-$canFallback = (-not $changed) -and (-not $r.timedout) -and (-not $NoFallback) -and (-not (Test-ArgError $log))
+# giu nguyen de review; timeout/loi tham so/loi ket noi server cung khong dem
+# sang model tiep.
+$canFallback = (-not $changed) -and (-not $r.timedout) -and (-not $NoFallback) -and
+  (-not (Test-ArgError $log)) -and (-not (Test-ServerSetupError $log))
 if ($canFallback) {
   $quotaPath = Test-QuotaOrUnavailable $log $r.code
   $fallbackSequence = if ($quotaPath) { $quotaFallbacks } else { $noChangeFallbacks }
@@ -476,17 +493,19 @@ if ($canFallback) {
     $r = Invoke-OpenCode $candidate.model $candidate.variant $log
     $usedModels += "$($candidate.model)" + $(if ($candidate.variant -ne "") { " ($($candidate.variant))" } else { "" })
     $changed = & git status --porcelain
-    if ($changed -or $r.timedout -or (Test-ArgError $log)) { break }
+    if ($changed -or $r.timedout -or (Test-ArgError $log) -or (Test-ServerSetupError $log)) { break }
   }
 }
 
 $stat = & git diff --stat
 
-# ---------- tu chay test suite khi co file thay doi ----------
+# ---------- tu chay test suite khi luot nay co sua file ----------
+# Chi tinh thay doi cua chinh luot nay: phan sua do cua lan truoc (-Resume) ma
+# coder khong dong vao thi la "khong sua gi" (5), khong phai verify fail (8).
 $testsRan    = $false
 $testsFailed = $false
 $testsTail   = @()
-if ($changed -and -not $r.timedout) {
+if ($changed -and -not $r.timedout -and $r.didWork) {
   if ($testCommand -ne "") {
     $prevEAP = $ErrorActionPreference
     $ErrorActionPreference = "Continue"
@@ -531,7 +550,9 @@ if ($r.timedout) {
   Write-Output 'TESTS: khong chay verify sau timeout; phai xac nhan coder da dung truoc.'
 } elseif ($changed) {
   Write-Output ""
-  if ($testsRan) {
+  if (-not $r.didWork) {
+    Write-Output "TESTS: bo qua - luot nay khong sua gi (thay doi dang co la cua luot truoc)"
+  } elseif ($testsRan) {
     Write-Output "TESTS:"
     Write-Output $testsTail
     if ($testsFailed) { Write-Output "TESTS: FAILED - xem chi tiet o tren" }
@@ -552,6 +573,10 @@ if ($r.timedout) { exit 124 }
 if ($testsFailed) { exit 8 }
 if (Test-ArgError $log) {
   Write-Output "ARGERROR: opencode in usage/help - prompt khong toi noi nguyen ven, KHONG phai model tu choi task"
+  exit 7
+}
+if (Test-ServerSetupError $log) {
+  Write-Output "CODERERROR: OpenCode CLI khong ket noi/xac thuc duoc server $Attach - kiem tra server va OPENCODE_PASSWORD, KHONG phai model tu choi task."
   exit 7
 }
 if ($null -eq $r.code -or $r.code -ne 0 -or (Test-OpenCodeApiError $log)) {

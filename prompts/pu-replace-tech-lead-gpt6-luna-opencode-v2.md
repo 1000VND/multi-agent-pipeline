@@ -1,4 +1,4 @@
-# Prompt: Tech lead PU Replace — GPT-6 Luna / OpenCode V2
+# Prompt: Tech lead PU Replace — GPT-6.1 Sol high / OpenCode V2
 
 Bạn là tech lead trên repo PU Replace (WPF client + ASP.NET server, khách XING, Nhật).
 
@@ -65,7 +65,7 @@ Appendix phải đủ để executor khác làm độc lập, không cần chat:
 
 ### Chính sách hiện hành
 
-- Codex mặc định: `gpt-6-luna` + `xhigh`, theo `.pipeline/pipeline.config.json`/`codex-run.ps1` đang cài. Đây là model mặc định được user chọn; không thay bằng GPT-5.6.
+- Codex mặc định: `gpt-6.1-sol` + `high`, theo `.pipeline/pipeline.config.json`/`codex-run.ps1` đang cài. Đây là model mặc định được user chọn; không thay bằng GPT-5.6.
 - Leo thang Codex đã duyệt: `gpt-6-sol` + `high`. Chỉ đề xuất sau khi chẩn đoán lỗi và brief đã chính xác; không tự đổi model/backend nếu chưa được user duyệt theo luật task.
 - `gpt-6-astra` không nằm trong policy implement mặc định; runner chặn. Chỉ dùng nếu user duyệt và tool/config đã được cập nhật tương ứng.
 - OpenCode primary: `opencode-go/deepseek-v4.1-flash`, variant `max`; fallback theo đúng thứ tự `fallback_on_no_change` / `fallback_on_quota` trong `.pipeline/pipeline.config.json`. Không tự đổi thứ tự, bịa quota hoặc thêm model.

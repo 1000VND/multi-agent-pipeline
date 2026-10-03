@@ -388,3 +388,106 @@ Describe "OpenCode session context rollover and complete association history" {
     Assert-MockCalled Invoke-RestMethod -Times 0 -Exactly -Scope It
   }
 }
+
+# Routes and shapes follow the OpenCode 2.0.16 OpenAPI document (/openapi.json).
+Describe "OpenCode V2 API with Basic auth" {
+  BeforeEach {
+    $script:testRepo = Join-Path $TestDrive ([guid]::NewGuid().ToString("N"))
+    New-Item -ItemType Directory -Path (Join-Path $script:testRepo ".pipeline") -Force | Out-Null
+    & git -C $script:testRepo init -q
+    $script:testMapPath = Join-Path $script:testRepo ".pipeline\tui-map.json"
+    Save-TestMap ([pscustomobject]@{ "claude-A" = [pscustomobject]@{ opencode_session = "ses_v2old"; url = "http://127.0.0.1:4097" } })
+    $savedPassword = $env:OPENCODE_PASSWORD
+    $savedServerPassword = $env:OPENCODE_SERVER_PASSWORD
+    $env:OPENCODE_PASSWORD = "v2-test-password"
+    $env:OPENCODE_SERVER_PASSWORD = $null
+    $global:PipelineOcTuiV2State = @{ repo = $script:testRepo; used = 10000; calls = @(); auth = @(); bodies = @(); rejectAll = $false; rejectPort = 0 }
+    Mock Invoke-RestMethod {
+      param($Uri, $Method, $Headers, $Body)
+      $state = $global:PipelineOcTuiV2State
+      $state.calls += "$Method $Uri"
+      $state.auth += [string]$Headers.Authorization
+      $port = ([uri]$Uri).Port
+      if ($state.rejectAll -or ($state.rejectPort -and $port -eq $state.rejectPort)) {
+        $failure = New-Object System.Exception "unauthorized"
+        $failure | Add-Member -NotePropertyName Response -NotePropertyValue ([pscustomobject]@{ StatusCode = 401 })
+        throw $failure
+      }
+      if ($port -ne 4097) { throw "connection refused" }
+      if ($Uri -like "*/api/info") { return [pscustomobject]@{ version = "2.0.16"; pid = 7; urls = @(); paths = [pscustomobject]@{ tmp = "x" } } }
+      if ($Uri -like "*/api/location") {
+        return [pscustomobject]@{ directory = $state.repo; project = [pscustomobject]@{ id = "global"; directory = $state.repo; canonical = $state.repo } }
+      }
+      if ($Uri -like "*/api/session/ses_v2old/context") {
+        $message = [pscustomobject]@{
+          type = "assistant"; time = [pscustomobject]@{ created = 1 }; model = [pscustomobject]@{ id = "m1"; providerID = "p1" }
+          tokens = [pscustomobject]@{ input = $state.used; output = 0; reasoning = 0; cache = [pscustomobject]@{ read = 0; write = 0 } }
+        }
+        return [pscustomobject]@{ data = @($message) }
+      }
+      if ($Uri -like "*/api/session/ses_v2old") {
+        return [pscustomobject]@{ data = [pscustomobject]@{ id = "ses_v2old"; location = [pscustomobject]@{ directory = $state.repo } } }
+      }
+      if ($Uri -like "*/api/model") {
+        return [pscustomobject]@{
+          location = [pscustomobject]@{ directory = $state.repo }
+          data = @([pscustomobject]@{ id = "m1"; modelID = "m1"; providerID = "p1"; limit = [pscustomobject]@{ context = 100000; output = 1000 } })
+        }
+      }
+      if ($Uri -like "*/api/session" -and "$Method" -eq "Post") {
+        $state.bodies += [string]$Body
+        return [pscustomobject]@{ data = [pscustomobject]@{ id = "ses_v2new"; location = [pscustomobject]@{ directory = $state.repo } } }
+      }
+      throw "Unexpected HTTP call $Method $Uri"
+    }
+    Mock Start-Process { throw "No window or process is allowed in this test" }
+  }
+  AfterEach {
+    $env:OPENCODE_PASSWORD = $savedPassword
+    $env:OPENCODE_SERVER_PASSWORD = $savedServerPassword
+  }
+  AfterAll { Remove-Variable -Name PipelineOcTuiV2State -Scope Global -ErrorAction SilentlyContinue }
+
+  It "reuses a V2 session below the threshold and authenticates every request" {
+    Push-Location $script:testRepo
+    try { $text = & $script:tuiSource -Key "claude-A" -Url "http://127.0.0.1:4097" -NoWindow | Out-String } finally { Pop-Location }
+    (Read-TestMap).'claude-A'.opencode_session | Should Be "ses_v2old"
+    $text | Should Match "API_VERSION=2"
+    $text | Should Match "TUI: opencode --server http://127.0.0.1:4097 --session ses_v2old"
+    # The password came from the user's own environment: no hint needed.
+    $text | Should Not Match "TUI_AUTH"
+    $expected = "Basic " + [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes("opencode:v2-test-password"))
+    @($global:PipelineOcTuiV2State.auth).Count | Should BeGreaterThan 3
+    @($global:PipelineOcTuiV2State.auth | Where-Object { $_ -ne $expected }).Count | Should Be 0
+  }
+
+  It "creates the V2 replacement session in the repo location when context is over the threshold" {
+    $global:PipelineOcTuiV2State.used = 90000
+    Push-Location $script:testRepo
+    try { & $script:tuiSource -Key "claude-A" -Url "http://127.0.0.1:4097" -NoWindow | Out-Null } finally { Pop-Location }
+    (Read-TestMap).'claude-A'.opencode_session | Should Be "ses_v2new"
+    $body = $global:PipelineOcTuiV2State.bodies[0] | ConvertFrom-Json
+    $body.location.directory | Should Be ((& git -C $script:testRepo rev-parse --show-toplevel).Replace('/', '\'))
+  }
+
+  It "skips a password-protected server while scanning and explains how to authenticate the TUI" {
+    $env:OPENCODE_PASSWORD = $null
+    $global:PipelineOcTuiV2State.rejectPort = 4096
+    Push-Location $script:testRepo
+    try { $text = & $script:tuiSource -Key "claude-A" -NoWindow | Out-String } finally { Pop-Location }
+    $text | Should Match "dung server san co cua repo tren cong 4097"
+    $text | Should Match "TUI_AUTH: "
+    $password = (Get-Content -Raw -LiteralPath (Join-Path $script:testRepo ".pipeline\logs\opencode-auth.json") | ConvertFrom-Json).password
+    $text.Contains($password) | Should Be $false
+    Assert-MockCalled Start-Process -Times 0 -Exactly -Scope It
+  }
+
+  It "rejects an explicit password-protected server with exit 4 without starting anything" {
+    $global:PipelineOcTuiV2State.rejectAll = $true
+    Push-Location $script:testRepo
+    try { & $script:tuiSource -Key "claude-A" -Url "http://127.0.0.1:4097" -NoWindow | Out-Null; $code = $LASTEXITCODE } finally { Pop-Location }
+    $code | Should Be 4
+    Assert-MockCalled Start-Process -Times 0 -Exactly -Scope It
+    (Read-TestMap).'claude-A'.opencode_session | Should Be "ses_v2old"
+  }
+}

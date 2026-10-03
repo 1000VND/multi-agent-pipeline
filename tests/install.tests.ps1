@@ -159,6 +159,66 @@ Describe "installer config migrations" {
     $actual.model_policy.opencode.variant | Should Be "max"
   }
 
+  It "migrates exact legacy Codex defaults to GPT-6.1 Sol high and keeps forbidden as a JSON array" {
+    $config = Get-InstallTemplate
+    $config.model_policy.codex.default.model = "gpt-5.6-luna"
+    $config.model_policy.codex.default.reasoning_effort = "xhigh"
+    $config.model_policy.codex.escalated.model = "gpt-5.6-terra"
+    $config.model_policy.codex.forbidden = @("gpt-5.6-sol", "gpt-6-astra")
+    Save-InstallConfig $installSandbox $config
+
+    $result = Invoke-TestInstaller $installSandbox
+    $result.code | Should Be 0
+    $result.text | Should Match 'MIGRATE:'
+    $actual = Read-InstallConfig $installSandbox
+    $actual.model_policy.codex.default.model | Should Be "gpt-6.1-sol"
+    $actual.model_policy.codex.default.reasoning_effort | Should Be "high"
+    $actual.model_policy.codex.escalated.model | Should Be "gpt-6-sol"
+    (@($actual.model_policy.codex.forbidden) -join '|') | Should Be "gpt-6-astra"
+    (Get-Content -LiteralPath $installSandbox.configPath -Raw) | Should Match '"forbidden":\s*\[\s*"gpt-6-astra"\s*\]'
+  }
+
+  It "migrates GPT-6 Luna xhigh to GPT-6.1 Sol high on reinstall" {
+    $config = Get-InstallTemplate
+    $config.model_policy.codex.default.model = "gpt-6-luna"
+    $config.model_policy.codex.default.reasoning_effort = "xhigh"
+    Save-InstallConfig $installSandbox $config
+
+    $result = Invoke-TestInstaller $installSandbox
+    $result.code | Should Be 0
+    $actual = Read-InstallConfig $installSandbox
+    $actual.model_policy.codex.default.model | Should Be "gpt-6.1-sol"
+    $actual.model_policy.codex.default.reasoning_effort | Should Be "high"
+  }
+
+  It "preserves custom reasoning effort when migrating a legacy Codex model" {
+    $config = Get-InstallTemplate
+    $config.model_policy.codex.default.model = "gpt-6-luna"
+    $config.model_policy.codex.default.reasoning_effort = "medium"
+    Save-InstallConfig $installSandbox $config
+
+    $result = Invoke-TestInstaller $installSandbox
+    $result.code | Should Be 0
+    $actual = Read-InstallConfig $installSandbox
+    $actual.model_policy.codex.default.model | Should Be "gpt-6.1-sol"
+    $actual.model_policy.codex.default.reasoning_effort | Should Be "medium"
+  }
+
+  It "adds the template Codex policy only when the project has none" {
+    $config = Get-InstallTemplate
+    [void]$config.model_policy.PSObject.Properties.Remove("codex")
+    Save-InstallConfig $installSandbox $config
+
+    $result = Invoke-TestInstaller $installSandbox
+    $result.code | Should Be 0
+    $result.text | Should Match 'MIGRATE:'
+    $actual = Read-InstallConfig $installSandbox
+    $actual.model_policy.codex.default.model | Should Be "gpt-6.1-sol"
+    $actual.model_policy.codex.escalated.model | Should Be "gpt-6-sol"
+    (@($actual.model_policy.codex.forbidden) -join '|') | Should Be "gpt-6-astra"
+    (Get-Content -LiteralPath $installSandbox.configPath -Raw) | Should Match '"forbidden":\s*\[\s*"gpt-6-astra"\s*\]'
+  }
+
   It "leaves invalid JSON untouched and reports a warning without claiming migration succeeded" {
     Set-Content -LiteralPath $installSandbox.configPath -Value '{"project_name": "broken",' -Encoding UTF8
     $before = Get-Content -LiteralPath $installSandbox.configPath -Raw

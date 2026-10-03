@@ -22,7 +22,10 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
+# PS 5.1 turns redirected native stderr into a terminating error under Stop.
+$ErrorActionPreference = "Continue"
 $repo = (& git rev-parse --show-toplevel 2>$null)
+$ErrorActionPreference = "Stop"
 if (-not $repo) { Write-Output "Khong phai git repo. Pipeline nay bat buoc dung git."; exit 2 }
 
 # Doc cau hinh pipeline cua repo. Uu tien: tham so dong lenh > config > mac dinh built-in.
@@ -41,9 +44,9 @@ if (-not $pipelineConfig) {
 $cfgCodex = $null
 if ($pipelineConfig) { $cfgCodex = $pipelineConfig.model_policy.codex.default }
 if (($Model -eq "") -and $cfgCodex.model) { $Model = [string]$cfgCodex.model }
-if ($Model -eq "") { $Model = "gpt-6-luna" }
+if ($Model -eq "") { $Model = "gpt-6.1-sol" }
 if (($ReasoningEffort -eq "") -and $cfgCodex.reasoning_effort) { $ReasoningEffort = [string]$cfgCodex.reasoning_effort }
-if ($ReasoningEffort -eq "") { $ReasoningEffort = "xhigh" }
+if ($ReasoningEffort -eq "") { $ReasoningEffort = "high" }
 if (($TimeoutSec -le 0) -and $pipelineConfig.timeout_sec) { $TimeoutSec = [int]$pipelineConfig.timeout_sec }
 if ($TimeoutSec -le 0) { $TimeoutSec = 1200 }
 $testCommand = ""
@@ -64,7 +67,12 @@ if ($pipelineConfig -and $pipelineConfig.model_policy.codex.forbidden) {
 }
 
 if (-not (Test-Path $TaskFile)) { Write-Output "Khong thay task file: $TaskFile"; exit 2 }
-$codexCommand = Get-Command codex -ErrorAction SilentlyContinue
+# npm cai codex.ps1, codex.cmd va script khong duoi canh nhau; PowerShell uu
+# tien .ps1, thu Start-Process/Process.Start khong chay duoc. Chon file thuc
+# thi that nhu cmd.exe: .exe/.cmd/.bat/.com dau tien trong PATH.
+$codexCommand = Get-Command codex -CommandType Application -All -ErrorAction SilentlyContinue |
+  Where-Object { $_.Extension -in @('.exe', '.cmd', '.bat', '.com') } |
+  Select-Object -First 1
 if (-not $codexCommand) {
   Write-Output "BLOCKED: khong tim thay Codex CLI trong PATH."
   exit 4
@@ -390,16 +398,20 @@ function Get-ProcessStartTime($proc) {
   try { return $proc.StartTime.ToUniversalTime().ToString("o") } catch { return $null }
 }
 
-function Close-ManagedTui {
+function Close-ManagedTui([string]$SessionKey = "") {
   $table = Read-MapTable
   if (-not $table.ContainsKey($tuiMapKey)) { return }
   $win = $table[$tuiMapKey]
   if (-not $win -or -not $win.pid) { return }
+  # Headless chi can dong TUI cua chinh phien Claude nay (cung thread).
+  if ($SessionKey -and [string]$win.session_key -ne $SessionKey) { return }
   $oldPid = [int]$win.pid
   $oldProc = Get-Process -Id $oldPid -ErrorAction SilentlyContinue
   # Chi dong tien trinh Codex ma runner da ghi lai; PID Windows co the bi tai su
-  # dung nen phai khop ca ten tien trinh lan thoi diem khoi dong.
-  if ($oldProc -and $oldProc.ProcessName -eq 'codex') {
+  # dung nen phai khop ca ten tien trinh lan thoi diem khoi dong. Ban ghi moi
+  # luu ten that (vd cmd khi Codex cai qua npm shim); ban ghi cu mac dinh codex.
+  $expectedName = if ($win.proc_name) { [string]$win.proc_name } else { 'codex' }
+  if ($oldProc -and $oldProc.ProcessName -eq $expectedName) {
     if (-not $win.proc_started) {
       # Ban ghi cu (truoc O2) khong co thoi diem khoi dong: khong du can cu de
       # giet, co the trung PID voi phien Codex khac cua nguoi dung. Bo qua ban
@@ -433,6 +445,7 @@ function Save-ManagedTui($tuiProcessId) {
   if ($proc) {
     $procStart = Get-ProcessStartTime $proc
     if ($procStart) { $record.proc_started = $procStart }
+    $record.proc_name = $proc.ProcessName
   }
   $table[$tuiMapKey] = $record
   Write-MapTable $table
@@ -457,11 +470,41 @@ function Get-MappedSession {
 
 function Get-EventValues($logPath) {
   if (-not (Test-Path $logPath)) { return @() }
-  $events = @()
-  Get-Content -Encoding UTF8 $logPath | ForEach-Object {
-    try { $events += ($_ | ConvertFrom-Json) } catch { }
+  # Collect through the pipeline: `$events +=` copies the array per line (quadratic).
+  return @(Get-Content -Encoding UTF8 $logPath | ForEach-Object {
+    try { $_ | ConvertFrom-Json -ErrorAction Stop } catch { }
+  })
+}
+
+# TUI poll: doc tiep tu vi tri lan truoc, chi lay dong da ghi tron. Rollout
+# cua thread dung lai ca phien Claude co the toi hang chuc MB; doc lai tu dau
+# moi 2 giay rat cham. Chi parse event_msg co the lien quan (task_complete,
+# item_completed, *error*).
+function Read-NewRolloutEvents($path, $state) {
+  $stream = [IO.File]::Open($path, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::ReadWrite)
+  try {
+    if ($stream.Length -lt $state.offset) { $state.offset = 0L }
+    $available = $stream.Length - $state.offset
+    if ($available -le 0) { return }
+    $buffer = New-Object byte[] $available
+    [void]$stream.Seek($state.offset, [IO.SeekOrigin]::Begin)
+    $read = 0
+    while ($read -lt $available) {
+      $count = $stream.Read($buffer, $read, $available - $read)
+      if ($count -le 0) { break }
+      $read += $count
+    }
+  } finally { $stream.Dispose() }
+  if ($read -le 0) { return }
+  # '\n' never occurs inside a UTF-8 multi-byte sequence: cut there only.
+  $end = [Array]::LastIndexOf($buffer, [byte]10, $read - 1)
+  if ($end -lt 0) { return }
+  $state.offset += $end + 1
+  foreach ($line in [Text.Encoding]::UTF8.GetString($buffer, 0, $end + 1).Split("`n")) {
+    if (-not $line.Contains('"event_msg"')) { continue }
+    if (-not ($line.Contains('task_complete') -or $line.Contains('item_completed') -or $line.Contains('error'))) { continue }
+    try { $line | ConvertFrom-Json -ErrorAction Stop } catch { }
   }
-  return $events
 }
 
 function Get-ThreadId($logPath) {
@@ -595,8 +638,15 @@ function Get-CodexSessionContext($threadId) {
     if (([string]$meta.payload.cwd).Replace('/', '\').TrimEnd('\') -ine $repo.Replace('/', '\').TrimEnd('\')) { continue }
     $window = 0L
     $used = $null
+    $reader = $null
     try {
-      foreach ($line in [IO.File]::ReadLines($file.FullName, [Text.Encoding]::UTF8)) {
+      # TUI cu co the con mo rollout de ghi: File.ReadLines (FileShare.Read) se
+      # loi chia se file, nen mo voi FileShare.ReadWrite.
+      $stream = [IO.File]::Open($file.FullName, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::ReadWrite)
+      $reader = New-Object IO.StreamReader($stream, [Text.Encoding]::UTF8)
+      while ($null -ne ($line = $reader.ReadLine())) {
+        # Chi cac dong compact/task_started/token usage moi can parse JSON.
+        if (-not ($line.Contains('token_') -or $line.Contains('compacted') -or $line.Contains('task_started'))) { continue }
         try { $event = $line | ConvertFrom-Json -ErrorAction Stop } catch { continue }
         $payload = $event.payload
         if ($event.type -eq "compacted" -or ($event.type -eq "event_msg" -and $payload.type -eq "context_compacted")) {
@@ -619,6 +669,7 @@ function Get-CodexSessionContext($threadId) {
         }
       }
     } catch { return $null }
+    finally { if ($reader) { $reader.Dispose() } }
     if ($window -gt 0 -and $null -ne $used) {
       return @{ used_tokens = $used; context_window = $window; percent = [math]::Round((100.0 * $used / $window), 2) }
     }
@@ -747,24 +798,8 @@ namespace Pipeline {
 
 $head = & git rev-parse HEAD
 
-function Get-WorktreeFingerprint {
-  $rawPaths = (& git -C $repo -c core.quotepath=false ls-files -z --modified --deleted --others --exclude-standard) -join "`n"
-  if ($LASTEXITCODE -ne 0) { throw 'Cannot snapshot worktree paths.' }
-  $stagedPaths = (& git -C $repo -c core.quotepath=false diff --cached --name-only -z) -join "`n"
-  if ($LASTEXITCODE -ne 0) { throw 'Cannot snapshot index paths.' }
-  $rawPaths += "`0" + $stagedPaths
-  $entries = foreach ($relative in @($rawPaths -split "`0" | Where-Object { $_ } | Sort-Object -Unique)) {
-    $path = Join-Path $repo $relative
-    if (Test-Path -LiteralPath $path -PathType Leaf) {
-      '{0}:{1}' -f $relative, (Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash
-    } elseif (Test-Path -LiteralPath $path -PathType Container) {
-      '{0}:submodule:{1}:{2}' -f $relative, ((& git -C $path rev-parse HEAD) -join ''), ((& git -C $path status --porcelain) -join "`n")
-    } else { '{0}:deleted' -f $relative }
-  }
-  $indexState = (& git -C $repo diff --cached --raw --no-abbrev) -join "`n"
-  if ($LASTEXITCODE -ne 0) { throw 'Cannot snapshot index state.' }
-  return (($entries -join "`n") + "`nINDEX:`n" + $indexState)
-}
+# Content fingerprint shared with oc-run (see pipeline-runtime.ps1).
+function Get-WorktreeFingerprint { Get-PipelineWorktreeFingerprint $repo }
 
 # Mac dinh la TUI goc cua Codex. -Exec hoac -NoTui quay ve duong codex exec.
 $useTui = ((-not $Exec) -and (-not $NoTui))
@@ -818,6 +853,7 @@ if ($useTui) {
   $sessionsRoot = Join-Path $codexHome "sessions"
   $repoNorm = $repo.Replace('/', '\').TrimEnd('\')
   $rollout = $null
+  $rolloutReader = @{ offset = 0L }
   $warnedNoRollout = $false
   $taskComplete = $false
   $lastAgentMessage = $null
@@ -839,21 +875,18 @@ if ($useTui) {
     } else {
       # Rollout cua luot resume chua ca cac luot cu; chi tinh event moi sau $t0
       # de khong nham task_complete cua luot truoc la cua luot nay.
-      $events = @(Get-EventValues $rollout.FullName | Where-Object {
-        [string]::CompareOrdinal([string]$_.timestamp, $t0Utc) -gt 0
-      })
-      $fileChanges = @($events | Where-Object {
-        $_.type -eq "event_msg" -and $_.payload.type -eq "item_completed" -and
-        ([string]$_.payload.item.type -match '^file_?change$')
-      }).Count
-      if ($fileChanges -gt $nativeFileChangeCount) { $nativeFileChangeCount = $fileChanges }
-      if (@($events | Where-Object { $_.type -eq "event_msg" -and ([string]$_.payload.type -match 'error') }).Count -gt 0) {
-        $hardError = $true
-      }
-      $doneEvent = $events | Where-Object { $_.type -eq "event_msg" -and $_.payload.type -eq "task_complete" } | Select-Object -Last 1
-      if ($doneEvent) {
-        $taskComplete = $true
-        $lastAgentMessage = [string]$doneEvent.payload.last_agent_message
+      foreach ($rolloutEvent in @(Read-NewRolloutEvents $rollout.FullName $rolloutReader)) {
+        if ($rolloutEvent.type -ne "event_msg" -or
+            [string]::CompareOrdinal([string]$rolloutEvent.timestamp, $t0Utc) -le 0) { continue }
+        $payloadType = [string]$rolloutEvent.payload.type
+        if ($payloadType -eq "item_completed" -and ([string]$rolloutEvent.payload.item.type -match '^file_?change$')) {
+          $nativeFileChangeCount++
+        }
+        if ($payloadType -match 'error') { $hardError = $true }
+        if ($payloadType -eq "task_complete") {
+          $taskComplete = $true
+          $lastAgentMessage = [string]$rolloutEvent.payload.last_agent_message
+        }
       }
     }
     if ($taskComplete) { break }
@@ -906,7 +939,9 @@ if ($useTui) {
 
   $codexArgs = @("exec")
   if ($Resume) {
-    $codexArgs += @("resume", "--json")
+    # `exec resume` khong nhan --approve-for-me/--cd sau subcommand; dat chung o
+    # cap exec de luot resume cung sandbox workspace-write nhu luot tao thread.
+    $codexArgs += @("--approve-for-me", "--cd", $repo, "resume", "--json")
     if ($Model -ne "") { $codexArgs += @("--model", $Model) }
     if ($ReasoningEffort -ne "") { $codexArgs += @("--config", "model_reasoning_effort=$ReasoningEffort") }
     $codexArgs += @($Session, "-")
@@ -934,6 +969,10 @@ if ($useTui) {
   $codexArgsQuoted = @($codexArgs | ForEach-Object {
     if ($_ -match '\s') { '"{0}"' -f $_ } else { $_ }
   })
+
+  # TUI do luot TUI truoc cua chinh phien Claude nay mo van giu cung thread:
+  # dong no truoc khi resume headless de khong co hai client tren mot thread.
+  if ($Resume -and $Session) { Close-ManagedTui -SessionKey $Key }
 
   # Trang thai worktree truoc khi chay, de biet luot nay co sua gi khong.
   $beforeFingerprint = Get-WorktreeFingerprint
@@ -1003,7 +1042,8 @@ if ($useTui) {
   $didWork = ((Get-FileChangeCount $log) -gt 0) -or $contentChanged
 }
 
-# Codex thoat khac 0 la runner/CLI hong, khong phai model tu choi task.
+# Codex thoat khac 0 la runner/CLI hong, khong phai model tu choi task; giong
+# lane OpenCode, van la loi (7) du da kip sua file - giu nguyen de review.
 # TUI khong tra exit code, nen chi bao loi khi rollout co event bao error ma
 # luot nay khong sua duoc gi - khong tu bia ma 7.
 if ($useTui) {
@@ -1012,16 +1052,18 @@ if ($useTui) {
     Write-LogTail $log
   }
 } elseif ($code -ne 0) {
-  Write-Output "CODEXERROR: codex thoat voi ma $code - KHONG phai model tu choi task, xem log"
+  Write-Output "CODEXERROR: codex thoat voi ma $code - KHONG phai model tu choi task; giu thay doi de review, xem log"
   Write-LogTail $log
 }
 
-# Giong runner OpenCode: co thay doi thi chay full suite de Claude co tin hieu som.
+# Giong runner OpenCode: luot nay co sua file thi chay full suite de Claude co
+# tin hieu som. Phan sua do cua lan truoc (-Resume) ma coder khong dong vao thi
+# la "khong sua gi" (5), khong phai verify fail (8).
 # Claude van phai tu chay test muc tieu va full suite trong buoc review.
 $testsRan = $false
 $testsFailed = $false
 $testsTail = @()
-if ($changed) {
+if ($changed -and $didWork) {
   if ($testCommand -ne "") {
     $prevEAP = $ErrorActionPreference
     $ErrorActionPreference = "Continue"
@@ -1067,7 +1109,9 @@ Write-Output "DIFFSTAT:"
 Write-Output $stat
 if ($changed) {
   Write-Output ""
-  if ($testsRan) {
+  if (-not $didWork) {
+    Write-Output "TESTS: bo qua - luot nay khong sua gi"
+  } elseif ($testsRan) {
     Write-Output "TESTS:"
     Write-Output $testsTail
     if ($testsFailed) { Write-Output "TESTS: FAILED - Claude can review chi tiet" }
@@ -1087,7 +1131,7 @@ Write-Output "--- (full log: $log) ---"
 if ($testsFailed) { exit 8 }
 if ($useTui) {
   if ($hardError -and (-not $didWork)) { exit 7 }
-} elseif (($code -ne 0) -and (-not $didWork)) { exit 7 }
+} elseif ($code -ne 0) { exit 7 }
 if (-not $didWork) { exit 5 }
 exit 0
 

@@ -19,6 +19,7 @@ function New-OpenCodeSandbox {
   @'
 param([string]$Key, [string]$Title, [string]$Url, [string]$Session, [switch]$Fresh, [switch]$NoWindow)
 if ($env:FAKE_OC_TUI_EXIT) { Write-Output 'BLOCKED: fixture TUI'; exit ([int]$env:FAKE_OC_TUI_EXIT) }
+if ($env:FAKE_OC_TUI_NOSESSION) { Write-Output '  fixture TUI without session'; exit 0 }
 $count = 0
 if (Test-Path -LiteralPath $env:FAKE_OC_TUI_CALLS) {
   $count = [int](Get-Content -Raw -LiteralPath $env:FAKE_OC_TUI_CALLS)
@@ -34,6 +35,7 @@ Write-Output "SESSION=fake-session-$count"
   @'
 @echo off
 echo %*>>"%FAKE_OC_ARGS%"
+if defined OPENCODE_PASSWORD echo HAS_PASSWORD>>"%FAKE_OC_ENV%"
 powershell.exe -NoProfile -Command "[Console]::OpenStandardInput().CopyTo([IO.File]::OpenWrite($env:FAKE_OC_STDIN)); if($env:FAKE_OC_CHANGE){[IO.File]::WriteAllText((Join-Path (Get-Location) 'change.txt'), $env:FAKE_OC_CHANGE)}; if($env:FAKE_OC_LOG){[Console]::WriteLine([Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($env:FAKE_OC_LOG)))}; if($env:FAKE_OC_SLEEP){Start-Sleep -Seconds 30}; if($env:FAKE_OC_EXIT){exit ([int]$env:FAKE_OC_EXIT)}"
 exit /b %ERRORLEVEL%
 '@ | Set-Content -LiteralPath (Join-Path $fake "opencode.cmd") -Encoding ASCII
@@ -57,6 +59,7 @@ exit /b %ERRORLEVEL%
     brief = $brief
     stdinFile = Join-Path $root "received-stdin.txt"
     argsFile = Join-Path $root "received-args.txt"
+    envFile = Join-Path $root "received-env.txt"
     tuiCalls = Join-Path $root "tui-calls.txt"
   }
 }
@@ -73,23 +76,32 @@ function Remove-OpenCodeSandbox($sandbox) {
   }
 }
 
-function Invoke-OpenCodeRunner($sandbox, [switch]$WithFallback, [switch]$Resume, [string]$Change = '', [int]$ExitCode = 0, [string]$LogText = '', [int]$TuiExit = 0, [string]$WorkingDirectory = '', [int]$TimeoutSec = 0, [switch]$Sleep, [string]$ServerUrl = '') {
+function Invoke-OpenCodeRunner($sandbox, [switch]$WithFallback, [switch]$Resume, [string]$Change = '', [int]$ExitCode = 0, [string]$LogText = '', [int]$TuiExit = 0, [string]$WorkingDirectory = '', [int]$TimeoutSec = 0, [switch]$Sleep, [string]$ServerUrl = '', [switch]$TuiNoSession) {
   $saved = @{
     Path = $env:Path
     STDIN = $env:FAKE_OC_STDIN
     ARGS = $env:FAKE_OC_ARGS
+    ENV = $env:FAKE_OC_ENV
     TUI_CALLS = $env:FAKE_OC_TUI_CALLS
     CHANGE = $env:FAKE_OC_CHANGE
     EXIT = $env:FAKE_OC_EXIT
     LOG = $env:FAKE_OC_LOG
     TUI_EXIT = $env:FAKE_OC_TUI_EXIT
+    TUI_NOSESSION = $env:FAKE_OC_TUI_NOSESSION
     SLEEP = $env:FAKE_OC_SLEEP
     URL = $env:FAKE_OC_URL
+    PASSWORD = $env:OPENCODE_PASSWORD
+    SERVER_PASSWORD = $env:OPENCODE_SERVER_PASSWORD
   }
   $env:Path = "$($sandbox.fake);$($saved.Path)"
   $env:FAKE_OC_STDIN = $sandbox.stdinFile
   $env:FAKE_OC_ARGS = $sandbox.argsFile
+  $env:FAKE_OC_ENV = $sandbox.envFile
   $env:FAKE_OC_TUI_CALLS = $sandbox.tuiCalls
+  $env:FAKE_OC_TUI_NOSESSION = if ($TuiNoSession) { '1' } else { $null }
+  # The runner must supply its own per-repo credential, not inherit ours.
+  $env:OPENCODE_PASSWORD = $null
+  $env:OPENCODE_SERVER_PASSWORD = $null
   $env:FAKE_OC_CHANGE = $Change
   $env:FAKE_OC_EXIT = [string]$ExitCode
   $env:FAKE_OC_LOG = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($LogText))
@@ -111,7 +123,11 @@ function Invoke-OpenCodeRunner($sandbox, [switch]$WithFallback, [switch]$Resume,
     $env:Path = $saved.Path
     $env:FAKE_OC_STDIN = $saved.STDIN
     $env:FAKE_OC_ARGS = $saved.ARGS
+    $env:FAKE_OC_ENV = $saved.ENV
     $env:FAKE_OC_TUI_CALLS = $saved.TUI_CALLS
+    $env:FAKE_OC_TUI_NOSESSION = $saved.TUI_NOSESSION
+    $env:OPENCODE_PASSWORD = $saved.PASSWORD
+    $env:OPENCODE_SERVER_PASSWORD = $saved.SERVER_PASSWORD
     $env:FAKE_OC_CHANGE = $saved.CHANGE
     $env:FAKE_OC_EXIT = $saved.EXIT
     $env:FAKE_OC_LOG = $saved.LOG
@@ -155,6 +171,34 @@ Describe "oc-run quota classification" {
   It "accepts ANSI-colored formatted errors" {
     (([char]27) + '[31mError: quota exceeded' + ([char]27) + '[0m') | Set-Content TestDrive:\quota.log
     (Test-QuotaOrUnavailable TestDrive:\quota.log 1) | Should Be $true
+  }
+}
+
+Describe "oc-run CLI setup error classification" {
+  BeforeAll {
+    $ast = [Management.Automation.Language.Parser]::ParseFile((Join-Path $PSScriptRoot '..\bin\oc-run.ps1'), [ref]$null, [ref]$null)
+    foreach ($name in @('Test-ArgError', 'Test-ServerSetupError')) {
+      $fn = $ast.Find({param($n) $n -is [Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq $name}, $true)
+      . ([scriptblock]::Create($fn.Extent.Text))
+    }
+  }
+  It "recognizes V2 usage output and flag errors, including a PowerShell stderr prefix" {
+    @('DESCRIPTION', '  Run OpenCode with a message', '', 'USAGE', '  opencode run [flags] [<message...>]') | Set-Content TestDrive:\arg.log
+    (Test-ArgError TestDrive:\arg.log) | Should Be $true
+    'opencode.cmd : Unrecognized flag: --variant in command opencode run' | Set-Content TestDrive:\arg.log
+    (Test-ArgError TestDrive:\arg.log) | Should Be $true
+  }
+  It "ignores JSON events that quote a flag error" {
+    '{"type":"text","part":{"text":"Unrecognized flag: --variant"}}' | Set-Content TestDrive:\arg.log
+    (Test-ArgError TestDrive:\arg.log) | Should Be $false
+  }
+  It "recognizes V2 server password and connection failures but not quoted assistant text" {
+    'opencode.cmd : Server at http://127.0.0.1:4096 requires a password; set OPENCODE_PASSWORD' | Set-Content TestDrive:\srv.log
+    (Test-ServerSetupError TestDrive:\srv.log) | Should Be $true
+    'Could not reach server at http://127.0.0.1:4096' | Set-Content TestDrive:\srv.log
+    (Test-ServerSetupError TestDrive:\srv.log) | Should Be $true
+    '{"type":"text","part":{"text":"Server at x rejected the password"}}' | Set-Content TestDrive:\srv.log
+    (Test-ServerSetupError TestDrive:\srv.log) | Should Be $false
   }
 }
 
@@ -342,5 +386,64 @@ Describe "oc-run high priority safety regressions" {
     & git -C $caseSandbox.repo add .pipeline/pipeline.config.json
     & git -C $caseSandbox.repo commit -qm config
     (Invoke-OpenCodeRunner $caseSandbox -Change 'new').code | Should Be 8
+  }
+}
+
+Describe "oc-run exit status and credential regressions" {
+  BeforeEach { $caseSandbox = New-OpenCodeSandbox }
+  AfterEach { Remove-OpenCodeSandbox $caseSandbox }
+
+  function Set-FailingTestCommand($sandbox) {
+    @{test_command='cmd.exe /d /c exit 1'} | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $sandbox.repo '.pipeline\pipeline.config.json')
+    & git -C $sandbox.repo add .pipeline/pipeline.config.json
+    & git -C $sandbox.repo commit -qm config
+  }
+
+  It "passes the server password to the OpenCode client, never on its command line" {
+    (Invoke-OpenCodeRunner $caseSandbox).code | Should Be 5
+    (Get-Content -Raw -LiteralPath $caseSandbox.envFile) | Should Match 'HAS_PASSWORD'
+    $password = (Get-Content -Raw -LiteralPath (Join-Path $caseSandbox.repo '.pipeline\logs\opencode-auth.json') | ConvertFrom-Json).password
+    (Get-Content -Raw -LiteralPath $caseSandbox.argsFile).Contains($password) | Should Be $false
+  }
+
+  It "reports a no-op resume as no change even when verification fails" {
+    Set-FailingTestCommand $caseSandbox
+    Set-Content -LiteralPath (Join-Path $caseSandbox.repo 'change.txt') -Value 'previous attempt'
+    $r = Invoke-OpenCodeRunner $caseSandbox -Resume
+    $r.code | Should Be 5
+    $r.text | Should Match 'TESTS: bo qua'
+  }
+
+  It "still fails verification when a resume makes new edits" {
+    Set-FailingTestCommand $caseSandbox
+    Set-Content -LiteralPath (Join-Path $caseSandbox.repo 'change.txt') -Value 'previous attempt'
+    (Invoke-OpenCodeRunner $caseSandbox -Resume -Change 'fixed').code | Should Be 8
+  }
+
+  It "returns exit 6 when the TUI helper produces no session" {
+    (Invoke-OpenCodeRunner $caseSandbox -TuiNoSession).code | Should Be 6
+    (Test-Path $caseSandbox.argsFile) | Should Be $false
+  }
+
+  It "maps an unexpected TUI helper failure to exit 6" {
+    (Invoke-OpenCodeRunner $caseSandbox -TuiExit 1).code | Should Be 6
+    (Test-Path $caseSandbox.argsFile) | Should Be $false
+  }
+
+  It "does not burn fallback models when the CLI cannot authenticate to the server" {
+    $r = Invoke-OpenCodeRunner $caseSandbox -WithFallback -ExitCode 1 -LogText 'Server at http://127.0.0.1:1 requires a password; set OPENCODE_PASSWORD'
+    $r.code | Should Be 7
+    @(Get-Content $caseSandbox.argsFile).Count | Should Be 1
+  }
+
+  It "exits 2 with a clear message outside a git repository" {
+    $outside = Join-Path $caseSandbox.root 'outside'
+    New-Item -ItemType Directory -Path $outside | Out-Null
+    $savedCeiling = $env:GIT_CEILING_DIRECTORIES
+    $env:GIT_CEILING_DIRECTORIES = $caseSandbox.root
+    try { $r = Invoke-OpenCodeRunner $caseSandbox -WorkingDirectory $outside }
+    finally { $env:GIT_CEILING_DIRECTORIES = $savedCeiling }
+    $r.code | Should Be 2
+    $r.text | Should Match 'Khong phai git repo'
   }
 }

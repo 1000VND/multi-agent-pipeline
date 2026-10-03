@@ -36,7 +36,7 @@ backend thì làm đúng; nếu không, Claude chọn trong lúc plan và trình
 | Coder | Runner Claude | Script | Model |
 |---|---|---|---|
 | OpenCode | `oc-coder` | `.pipeline/bin/oc-run.ps1` | `deepseek-v4.1-flash` (`max`), fallback theo chuỗi policy |
-| Codex | `codex-coder` | `.pipeline/bin/codex-run.ps1` | `gpt-6-luna` + `xhigh`; leo thang `gpt-6-sol` + `high` |
+| Codex | `codex-coder` | `.pipeline/bin/codex-run.ps1` | `gpt-6.1-sol` + `high`; cấu hình escalated `gpt-6-sol` + `high` |
 
 Để dùng backend Codex, máy chạy Claude phải có lệnh `codex` trong `PATH` và Codex
 CLI đã đăng nhập. Runner dùng authentication đã lưu của CLI, không đọc hoặc ghi API
@@ -52,10 +52,10 @@ nguyên để review; không thả coder thứ hai vào đè lên thay đổi. M
 | Lane | Mặc định | Leo thang |
 |---|---|---|
 | OpenCode | `opencode-go/deepseek-v4.1-flash` + variant `max` | chuỗi fallback theo policy bên dưới |
-| Codex | `gpt-6-luna` + `model_reasoning_effort=xhigh` | `gpt-6-sol` + `model_reasoning_effort=high` |
+| Codex | `gpt-6.1-sol` + `model_reasoning_effort=high` | `gpt-6-sol` + `model_reasoning_effort=high` |
 
 **Cấm dùng để implement code nếu chưa được duyệt:** `gpt-6-astra`. Runner
-`.pipeline/bin/codex-run.ps1` chặn cứng model này bằng `exit 2`. GPT-6 Luna là mặc định;
+`.pipeline/bin/codex-run.ps1` chặn cứng model này bằng `exit 2`. GPT-6.1 Sol + high là mặc định;
 GPT-6 Sol chỉ dùng khi leo thang theo chính sách và được user duyệt.
 Với OpenCode V2, runner ghép variant vào model theo dạng `provider/model#variant` và dùng
 `--server <URL>`; không tự thêm cờ V1 `--variant` hoặc `--attach` vào lệnh V2.
@@ -138,6 +138,8 @@ powershell -NoProfile -File .pipeline/bin/oc-run.ps1 -TaskFile .pipeline/tasks/<
 
 Sau khi runner trả URL/session, luôn chuyển nguyên dòng `TUI:` cho người dùng. Runner tự chọn cú pháp theo API server: V1 là `opencode attach <URL> -s <session-id>`, V2 là `opencode --server <URL> --session <session-id>`. Với `-NoTui`, runner không mở CMD nhưng vẫn cấp session và in dòng này để người dùng tự mở lại TUI. `--auto` là cờ quyền tự duyệt, không phải chế độ hiển thị.
 
+Server V2 luôn đòi mật khẩu (user `opencode`). Runner dùng `OPENCODE_PASSWORD`/`OPENCODE_SERVER_PASSWORD` nếu đã đặt, nếu không thì dùng mật khẩu riêng của repo trong `.pipeline/logs/opencode-auth.json`, và tự truyền cho server, `opencode run` và cửa sổ TUI của nó. Có dòng `TUI_AUTH:` thì chuyển kèm dòng `TUI:`; không tự đọc hay in mật khẩu ra hội thoại.
+
 Nó đóng cửa sổ CMD đang mở, rồi **tra bản đồ phiên Claude → phiên opencode**:
 
 - Phiên Claude này đã có phiên opencode và context chưa vượt ngưỡng → **dùng lại**
@@ -213,7 +215,7 @@ trong repo mới thì chạy một lượt `-Exec`/`-NoTui` nhỏ trong repo đ�
 đăng ký tin cậy), rồi hãy để mặc định. Thread liên thông hai chiều: thread do TUI tạo
 vẫn `codex exec resume <id>` được, và thread do `codex exec` tạo vẫn mở lại được bằng TUI.
 
-Runner tự ép model theo chính sách (`-Model gpt-6-luna`, `-ReasoningEffort xhigh`),
+Runner tự ép model theo chính sách (`-Model gpt-6.1-sol`, `-ReasoningEffort high`),
 không phụ thuộc `~/.codex/config.toml` của máy nữa; chỉ đổi khi leo thang theo mục
 **Chính sách model** ở trên.
 
@@ -289,6 +291,9 @@ Nội dung hội thoại do CLI lưu trên máy, còn map lưu liên kết để
   Nếu có `.pipeline/logs/opencode-pending.json`, session timeout chưa được xác nhận dừng:
   báo URL/session cho user, kiểm tra client đã dừng và abort/idle đúng session; chỉ dọn
   marker sau khi user cho phép và xác nhận cả hai đã dừng. Không giết cả server dùng chung.
-- Chuyển dòng `TUI:`/`CONTEXT:` ngay trong lúc runner chạy nếu công cụ cho phép nhận output
+- Chuyển dòng `TUI:`/`TUI_AUTH:`/`CONTEXT:` ngay trong lúc runner chạy nếu công cụ cho phép nhận output
   trung gian. Nếu subagent không chuyển tiếp được, nói rõ giới hạn; không đợi kết thúc rồi
   tuyên bố đã cung cấp link theo dõi từ đầu.
+- Subagent gọi runner qua Bash với timeout tối đa (600000 ms). `timeout_sec` mặc định 1200
+  giây dài hơn mức đó: Bash trả về trước `--- KET QUA` nghĩa là runner có thể còn chạy
+  (`STATUS: running`) — không dispatch lượt khác, không tăng `attempts` lần nữa.

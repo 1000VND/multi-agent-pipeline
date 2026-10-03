@@ -26,7 +26,7 @@
       ]
     },
     "codex": {
-      "default": { "model": "gpt-6-luna", "reasoning_effort": "xhigh" },
+      "default": { "model": "gpt-6.1-sol", "reasoning_effort": "high" },
       "escalated": { "model": "gpt-6-sol", "reasoning_effort": "high" },
       "forbidden": ["gpt-6-astra"]
     }

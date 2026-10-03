@@ -24,8 +24,11 @@ param(
 
 $ErrorActionPreference = "Stop"
 . (Join-Path $PSScriptRoot 'pipeline-runtime.ps1')
+# PS 5.1 turns redirected native stderr into a terminating error under Stop.
+$ErrorActionPreference = "Continue"
 $repo = (& git rev-parse --show-toplevel 2>$null)
-if (-not $repo) { Write-Error "Khong phai git repo."; exit 2 }
+$ErrorActionPreference = "Stop"
+if (-not $repo) { [Console]::Error.WriteLine("Khong phai git repo."); exit 2 }
 
 $stateDir = Join-Path $repo ".pipeline"
 $winFile  = Join-Path $stateDir "tui.json"      # cua so dang mo
@@ -54,14 +57,6 @@ function Set-ObjectProperty($object, $name, $value) {
   $prop = $object.PSObject.Properties[$name]
   if ($prop) { $prop.Value = $value } else { $object | Add-Member -NotePropertyName $name -NotePropertyValue $value }
 }
-function Test-Server {
-  try {
-    $prefix = Get-OpenCodeApiPrefix $Url
-    Invoke-RestMethod -Uri (Get-OpenCodeApiUri $Url $prefix 'session') -TimeoutSec 4 -ErrorAction Stop | Out-Null
-    return $true
-  }
-  catch { return $false }
-}
 # Kho phien cua opencode dung chung toan may: hoi server cua repo A ve phien cua
 # repo B van tra ve day du. Phien chi dung duoc khi directory cua no khop repo hien tai.
 # Tra ve: ok = phien ton tai VA thuoc dung repo; exists = phien con tren server;
@@ -71,14 +66,11 @@ function Test-Session($sid) {
   $dir = $null
   $prefix = Get-OpenCodeApiPrefix $Url
   try {
-    $one = Invoke-RestMethod -Uri (Get-OpenCodeApiUri $Url $prefix ('session/' + [uri]::EscapeDataString($sid))) -TimeoutSec 6 -ErrorAction Stop
+    $one = Invoke-OpenCodeApi -Uri (Get-OpenCodeApiUri $Url $prefix ('session/' + [uri]::EscapeDataString($sid))) -TimeoutSec 6
     $one = Get-OpenCodeApiData $one $prefix
     $dir = Get-OpenCodeSessionDirectory $one $prefix
   } catch {
-    $statusCode = 0
-    if ($_.Exception.Response -and $_.Exception.Response.StatusCode) {
-      try { $statusCode = [int]$_.Exception.Response.StatusCode } catch { }
-    }
+    $statusCode = Get-HttpStatusCode $_
     return @{ ok = $false; exists = $false; unknown = ($statusCode -ne 404); directory = "" }
   }
   if (-not $dir) { return @{ ok = $false; exists = $false; unknown = $true; directory = "" } }
@@ -90,20 +82,33 @@ function Normalize-RepoPath($p) {
   if (-not $p) { return "" }
   return ([string]$p -replace '/', '\').TrimEnd('\')
 }
-# worktree cua server: $null = khong ket noi duoc, "" = co dich vu khac, con lai la duong dan.
+# worktree cua server: $null = khong ket noi duoc, "" = co dich vu khac,
+# $script:WorktreeAuthRejected = server OpenCode tu choi mat khau, con lai la duong dan.
+$script:WorktreeAuthRejected = '<auth-rejected>'
 function Get-Worktree($baseUrl) {
-  $prefix = Get-OpenCodeApiPrefix $baseUrl
+  $probe = Get-OpenCodeServerProbe $baseUrl
+  if ($probe.authRejected) { return $script:WorktreeAuthRejected }
+  if ($probe.prefix -eq '/api') {
+    # V2 has no /project/current; /api/location reports the server directory.
+    try { $location = Invoke-OpenCodeApi -Uri (Get-OpenCodeApiUri $baseUrl '/api' 'location') -TimeoutSec 3 }
+    catch {
+      if ((Get-HttpStatusCode $_) -eq 401) { return $script:WorktreeAuthRejected }
+      return ""
+    }
+    if ($location -and $location.directory) { return [string]$location.directory }
+    return ""
+  }
   try {
-    $proj = Invoke-RestMethod -Uri (Get-OpenCodeApiUri $baseUrl $prefix 'project/current') -TimeoutSec 3 -ErrorAction Stop
+    $proj = Invoke-OpenCodeApi -Uri (Get-OpenCodeApiUri $baseUrl '' 'project/current') -TimeoutSec 3
   } catch {
+    if ((Get-HttpStatusCode $_) -eq 401) { return $script:WorktreeAuthRejected }
     return $null
   }
-  if ($prefix -eq '/api' -and $proj -and $proj.directory) { return [string]$proj.directory }
   if ($proj -and $proj.worktree) { return [string]$proj.worktree }
   return ""
 }
 
-# OpenCode ghi usage theo từng message va cong lifetime theo session. Chi dung
+# OpenCode ghi usage theo tung message va cong lifetime theo session. Chi dung
 # message gan nhat (context thuc te cua request), TUYET DOI khong dung tong
 # lifetime vi cache.read se lam no phinh ra du context window.
 function Get-Number($object, $names) {
@@ -141,9 +146,9 @@ function Get-OpenCodeSessionContext($sid) {
   try {
     $prefix = $script:OpenCodeApiPrefix
     if ($prefix -eq '/api') {
-      $response = Invoke-RestMethod -Uri (Get-OpenCodeApiUri $Url $prefix ('session/' + [uri]::EscapeDataString($sid) + '/context')) -TimeoutSec 8 -ErrorAction Stop
+      $response = Invoke-OpenCodeApi -Uri (Get-OpenCodeApiUri $Url $prefix ('session/' + [uri]::EscapeDataString($sid) + '/context')) -TimeoutSec 8
     } else {
-      $response = Invoke-RestMethod -Uri "$Url/session/$sid/message?limit=100" -TimeoutSec 8 -ErrorAction Stop
+      $response = Invoke-OpenCodeApi -Uri "$Url/session/$sid/message?limit=100" -TimeoutSec 8
     }
     # On PowerShell 5.1, $array.missingProperty yields an array of nulls
     # whose boolean value is true. Detect envelopes on the object itself.
@@ -191,11 +196,11 @@ function Get-OpenCodeSessionContext($sid) {
     if ($prefix -eq '/api') {
       $modelId = [string]$message.model.id
       $providerId = [string]$message.model.providerID
-      try { $catalog = Invoke-RestMethod -Uri (Get-OpenCodeApiUri $Url $prefix 'model') -TimeoutSec 8 -ErrorAction Stop } catch { $catalog = $null }
+      try { $catalog = Invoke-OpenCodeApi -Uri (Get-OpenCodeApiUri $Url $prefix 'model') -TimeoutSec 8 } catch { $catalog = $null }
     } else {
       $modelId = [string]$message.info.modelID
       $providerId = [string]$message.info.providerID
-      try { $catalog = Invoke-RestMethod -Uri "$Url/provider" -TimeoutSec 8 -ErrorAction Stop } catch { $catalog = $null }
+      try { $catalog = Invoke-OpenCodeApi -Uri "$Url/provider" -TimeoutSec 8 } catch { $catalog = $null }
     }
     $window = Get-ModelContextLimit $catalog $providerId $modelId $prefix
     if ($used -le 0 -or $window -le 0) { return $null }
@@ -321,22 +326,46 @@ if (-not $NoWindow) {
 }
 if ($CloseOnly) { Write-Output "CloseOnly: xong."; exit 0 }
 
+# OpenCode V2 servers always require Basic auth. Every API call sends the
+# pipeline credential; servers and TUI windows started here receive it via env.
+$openCodeAuth = Initialize-OpenCodeAuth $repo
+function Invoke-WithOpenCodePassword([scriptblock]$Action) {
+  $savedPassword = $env:OPENCODE_PASSWORD
+  $env:OPENCODE_PASSWORD = $openCodeAuth.password
+  try { & $Action } finally { $env:OPENCODE_PASSWORD = $savedPassword }
+}
+
 # ---------- 2. tim hoac tao server cua dung repo nay ----------
 # Server opencode gan chat voi thu muc no duoc khoi dong: attach vao server cua
 # repo khac la coder doc/sua nham du an. Vi vay moi repo phai co server rieng.
 $repoNorm = Normalize-RepoPath $repo
+$authRejectedMessage = "server OpenCode tu choi mat khau cua pipeline (HTTP 401). Dat OPENCODE_PASSWORD bang mat khau cua server do, hoac de pipeline tu bat server rieng."
 
 function Start-RepoServer($port) {
   Write-Output "  bat server tren cong $port ..."
-  Start-Process -FilePath "opencode.cmd" -ArgumentList @("serve", "--port", "$port") `
-                -WorkingDirectory $repo -WindowStyle Hidden | Out-Null
-  $deadline = (Get-Date).AddSeconds(30)
+  $server = Invoke-WithOpenCodePassword {
+    Start-Process -FilePath "opencode.cmd" -ArgumentList @("serve", "--port", "$port") `
+                  -WorkingDirectory $repo -WindowStyle Hidden -PassThru
+  }
+  $serverStarted = Get-OpenCodeProcessStart $server
+  # V2 can take a while on first start (data migration) before it answers.
+  $deadline = (Get-Date).AddSeconds(60)
   while ((Get-Date) -le $deadline) {
     $wt = Get-Worktree "http://127.0.0.1:$port"
-    if ($wt -and ((Normalize-RepoPath $wt) -ieq $repoNorm)) { return }
+    if ($wt -and $wt -ne $script:WorktreeAuthRejected -and ((Normalize-RepoPath $wt) -ieq $repoNorm)) { return }
+    if (-not (Get-Process -Id $server.Id -ErrorAction SilentlyContinue)) { break }
     Start-Sleep -Milliseconds 400
   }
-  [Console]::Error.WriteLine("LOI: server tren cong $port khong dung repo '$repo' sau 30s.")
+  # Never leave an unusable server behind: every retry would leak one more.
+  $leftover = Get-Process -Id $server.Id -ErrorAction SilentlyContinue
+  if ($leftover -and $serverStarted -and (Get-OpenCodeProcessStart $leftover) -eq $serverStarted) {
+    $previousEAP = $ErrorActionPreference
+    try {
+      $ErrorActionPreference = 'Continue'
+      & taskkill.exe /PID $server.Id /T /F 2>&1 | Out-Null
+    } finally { $ErrorActionPreference = $previousEAP }
+  }
+  [Console]::Error.WriteLine("LOI: server tren cong $port khong xac nhan dung repo '$repo' sau 60s.")
   exit 4
 }
 
@@ -346,6 +375,9 @@ if ($Url -ne "") {
   $wt = Get-Worktree $Url
   if ($null -eq $wt) {
     Start-RepoServer ([uri]$Url).Port
+  } elseif ($wt -eq $script:WorktreeAuthRejected) {
+    [Console]::Error.WriteLine("LOI: $Url - $authRejectedMessage")
+    exit 4
   } elseif ($wt -eq "") {
     [Console]::Error.WriteLine("LOI: $Url co dich vu khac, khong phai opencode.")
     exit 4
@@ -355,8 +387,10 @@ if ($Url -ne "") {
   }
 } else {
   # Quet cong 4096-4105: uu tien server cua dung repo, ghi nho cong trong dau tien.
+  # Server tu choi mat khau khong xac minh duoc repo nen bi bo qua nhu server la.
   $firstFree = 0
   $chosen    = ""
+  $rejectedPorts = @()
   for ($p = 4096; $p -le 4105; $p++) {
     $cand = "http://127.0.0.1:$p"
     $wt = Get-Worktree $cand
@@ -364,6 +398,7 @@ if ($Url -ne "") {
       if ($firstFree -eq 0) { $firstFree = $p }
       continue
     }
+    if ($wt -eq $script:WorktreeAuthRejected) { $rejectedPorts += $p; continue }
     if ($wt -eq "") { continue }
     if ((Normalize-RepoPath $wt) -ieq $repoNorm) { $chosen = $cand; break }
   }
@@ -374,7 +409,8 @@ if ($Url -ne "") {
     $Url = "http://127.0.0.1:$firstFree"
     Start-RepoServer $firstFree
   } else {
-    [Console]::Error.WriteLine("LOI: het cong 4096-4105, moi cong deu bi server cua repo khac chiem.")
+    $detail = if ($rejectedPorts.Count -gt 0) { " Cong $($rejectedPorts -join ', '): $authRejectedMessage" } else { "" }
+    [Console]::Error.WriteLine("LOI: het cong 4096-4105, moi cong deu bi server khac chiem.$detail")
     exit 4
   }
 }
@@ -462,9 +498,10 @@ try {
     }
     $body = @{ title = $Title } | ConvertTo-Json -Compress
     if ($script:OpenCodeApiPrefix -eq '/api') {
-      $body = @{ title = $Title; location = @{ directory = $repo } } | ConvertTo-Json -Compress
+      # Same native path the server reports, so the session lands in its location.
+      $body = @{ title = $Title; location = @{ directory = ([string]$repo).Replace('/', '\') } } | ConvertTo-Json -Compress
     }
-    $created = Invoke-RestMethod -Uri (Get-OpenCodeApiUri $Url $script:OpenCodeApiPrefix 'session') -Method Post -Body $body -ContentType "application/json" -TimeoutSec 20
+    $created = Invoke-OpenCodeApi -Uri (Get-OpenCodeApiUri $Url $script:OpenCodeApiPrefix 'session') -Method Post -Body $body -ContentType "application/json" -TimeoutSec 20
     $created = Get-OpenCodeApiData $created $script:OpenCodeApiPrefix
     $sid = [string]$created.id
     if (-not $sid) { throw "Khong tao duoc session." }
@@ -499,9 +536,11 @@ try {
 # ---------- 4. mo cua so CMD moi ----------
 if (-not $NoWindow) {
   $resumeCommand = Get-OpenCodeResumeCommand $Url $sid $script:OpenCodeApiPrefix
-  $proc = Start-Process -FilePath "cmd.exe" `
-            -ArgumentList @("/k", "title opencode $sid && $resumeCommand") `
-            -WorkingDirectory $repo -PassThru
+  $proc = Invoke-WithOpenCodePassword {
+    Start-Process -FilePath "cmd.exe" `
+                  -ArgumentList @("/k", "title opencode $sid && $resumeCommand") `
+                  -WorkingDirectory $repo -PassThru
+  }
 
   @{ pid = $proc.Id; sid = $sid; key = $Key; started = (Get-Date).ToString("s"); proc_started = (Get-OpenCodeProcessStart $proc) } |
     ConvertTo-Json | Set-Content -Path $winFile -Encoding utf8
@@ -515,3 +554,7 @@ Write-Output "SESSION=$sid"
 $resumeCommand = Get-OpenCodeResumeCommand $Url $sid $script:OpenCodeApiPrefix
 Write-Output "API_VERSION=$script:OpenCodeVersion"
 Write-Output "TUI: $resumeCommand"
+if ($script:OpenCodeVersion -eq 2 -and $openCodeAuth.source -eq 'file') {
+  # The V2 client needs the server password; never print the password itself.
+  Write-Output ("TUI_AUTH: server V2 can mat khau cua pipeline. Truoc lenh TUI, trong PowerShell: `$env:OPENCODE_PASSWORD=(Get-Content -Raw '{0}' | ConvertFrom-Json).password" -f ($openCodeAuth.file -replace "'", "''"))
+}

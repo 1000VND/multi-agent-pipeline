@@ -41,7 +41,8 @@ cd multi-agent-pipeline
 `<repo-dich>` phải là git repo (chạy `git init` trước nếu chưa). Install chạy lại được
 nhiều lần: lần sau cập nhật phần code, giữ nguyên `state.json` và các field riêng của
 `pipeline.config.json`. Schema fallback OpenCode được tự migrate; Codex chỉ đổi từ
-GPT-5.6 Luna/Terra sang GPT-6 Luna/Sol khi config còn đúng các mặc định cũ. Policy đã
+GPT-5.6 Luna hoặc GPT-6 Luna + xhigh sang GPT-6.1 Sol + high, và GPT-5.6 Terra sang
+GPT-6 Sol khi config còn đúng các mặc định cũ. Policy đã
 tùy chỉnh được giữ nguyên. `session_rollover.context_percent` được bổ sung nếu chưa có.
 Thêm `-Force` nếu muốn đè cả file dữ liệu — khi đó install in rõ từng file bị đè.
 
@@ -98,6 +99,10 @@ powershell -NoProfile -File .pipeline\bin\codex-run.ps1 -TaskFile .pipeline\task
 tự nối lại thread đã gắn với phiên Claude hiện tại. Brief phải **tự chứa** vì coder không
 thấy hội thoại này. Chi tiết quy trình nằm trong `SKILL.md` mà Claude đọc.
 
+Gọi runner qua công cụ Bash của Claude Code thì đặt timeout Bash tối đa (600000 ms).
+`timeout_sec` mặc định là 1200 giây, dài hơn mức tối đa đó: nếu Bash trả về trước khi
+runner in `--- KET QUA`, coi như runner còn đang chạy, không gọi lượt khác đè lên.
+
 ## pipeline.config.json
 
 | Khóa | Ý nghĩa |
@@ -119,10 +124,10 @@ chạy tiếp bằng mặc định built-in, không fail.
 | Lane | Mặc định | Leo thang |
 |---|---|---|
 | OpenCode | `opencode-go/deepseek-v4.1-flash` + variant `max` | fallback theo chuỗi bên dưới |
-| Codex | `gpt-6-luna` + `model_reasoning_effort=xhigh` | `gpt-6-sol` + `model_reasoning_effort=high` |
+| Codex | `gpt-6.1-sol` + `model_reasoning_effort=high` | `gpt-6-sol` + `model_reasoning_effort=high` |
 
 Cấm dùng `gpt-6-astra` để implement code nếu chưa được user duyệt; runner Codex chặn cứng
-bằng `exit 2`. GPT-6 Luna là mặc định theo policy; GPT-6 Sol dành cho leo thang đã được
+bằng `exit 2`. GPT-6.1 Sol + high là mặc định theo policy; GPT-6 Sol dành cho cấu hình escalated đã được
 duyệt. Thang leo bậc và luật worktree sạch nằm trong `SKILL.md`.
 
 ### Fallback OpenCode
@@ -135,7 +140,8 @@ Nếu primary DeepSeek V4.1 Flash báo hết quota/rate limit hoặc model khôn
 đổi thứ tự để ưu tiên phương án rẻ hơn trước: **Qwen3.8 Flash** (`xhigh`) →
 **LongCat-2.0** (`high`) → **MiMo V2.5 Pro** → **DeepSeek V4 Flash Vision Exp** (`max`)
 → **DeepSeek V4 Flash** (`max`).
-Runner dừng chuỗi khi một model đã sửa file, timeout, hoặc lỗi tham số CLI.
+Runner dừng chuỗi khi một model đã sửa file, timeout, lỗi tham số CLI, hoặc CLI không
+kết nối/xác thực được server (đổi model cũng vô ích).
 Log OpenCode dùng `--format json`: chỉ sự kiện lỗi API (hoặc dòng lỗi CLI rõ ràng
 kèm exit code thất bại) kích hoạt nhánh quota; câu trả lời nhắc tới quota không kích hoạt.
 
@@ -156,10 +162,13 @@ cả hai backend sẽ bị chặn với `10`. File này không tự hết hạn.
 marker, xác minh client đã dừng và session đã abort/idle đúng repo, rồi xin user cho phép
 dọn marker. Không xóa marker chỉ vì PID runner đã chết; không kill toàn bộ server để dọn.
 
-Với `-Resume`, cả hai runner so sánh nội dung file trước/sau lượt chạy, không tính phần
-sửa dở cũ là kết quả mới, kể cả khi gọi từ thư mục con. Không sửa gì thì thoát `5`;
-CLI lỗi hoặc OpenCode có JSON error event thì thoát `7` dù CLI trả `0` và có
-file thay đổi, giữ nguyên các file để review. Không thử fallback đè lên worktree bẩn.
+Với `-Resume`, cả hai runner so sánh nội dung file trước/sau lượt chạy (kể cả file tên
+tiếng Việt/Unicode), không tính phần sửa dở cũ là kết quả mới, kể cả khi gọi từ thư mục
+con. Không sửa gì thì thoát `5` và không chạy `test_command`: phần sửa dở cũ đang fail
+test không bị báo nhầm thành verify thất bại (`8`). CLI thoát khác `0` (cả Codex headless)
+hoặc OpenCode có JSON error event thì thoát `7` kể cả khi đã có file thay đổi — với
+OpenCode kể cả khi CLI trả `0` — và giữ nguyên các file để review. Không thử fallback đè
+lên worktree bẩn.
 Ở cả hai lane, lệnh test đã cấu hình mà phát sinh exception/lỗi PowerShell cũng
 được tính là verify thất bại (`8`), không còn bỏ qua rồi trả thành công.
 
@@ -171,8 +180,12 @@ file thay đổi, giữ nguyên các file để review. Không thử fallback đ
 - Danh tính phiên lấy theo thứ tự `-Key`, `CLAUDE_CODE_HOST_SESSION_ID`,
   `CLAUDE_CODE_SESSION_ID`. Thiếu cả ba thì runner in `BLOCKED:` và thoát `11` thay vì
   gộp các lần chạy khác nhau vào một key chung (không còn key `no-claude-session`).
-- Bản đồ TUI lưu cả PID lẫn thời điểm khởi động của tiến trình; runner chỉ đóng TUI khi
-  PID còn sống, đúng tên `codex` và đúng thời điểm khởi động. Bản ghi cũ thiếu thời điểm
+- Runner gọi file thực thi thật của Codex: `.exe`/`.cmd` đầu tiên trong `PATH`. Khi Codex
+  cài qua npm, PowerShell ưu tiên shim `codex.ps1` mà `Start-Process`/`Process.Start`
+  không chạy được, nên runner dùng `codex.cmd`.
+- Bản đồ TUI lưu PID, tên tiến trình và thời điểm khởi động; runner chỉ đóng TUI khi
+  PID còn sống, đúng tên đã ghi (`codex`, hoặc `cmd` khi chạy qua shim npm; bản ghi cũ
+  không có tên thì coi là `codex`) và đúng thời điểm khởi động. Bản ghi cũ thiếu thời điểm
   khởi động bị bỏ qua (cửa sổ cũ có thể còn mở) thay vì giết nhầm PID đã bị tái sử dụng.
 - Mỗi repo chỉ chạy một `codex-run.ps1` tại một thời điểm nhờ **run lock** theo repo
   (`.pipeline/logs/codex-run.lock`, đã ignore). Lượt chồng lên thoát ngay với
@@ -189,6 +202,9 @@ file thay đổi, giữ nguyên các file để review. Không thử fallback đ
 - `-Exec` hoặc `-NoTui` chạy headless, không mở cửa sổ nào.
   Nếu đã có thread, runner in `TUI: codex resume <thread-id>` để mở lại đúng phiên;
   lượt tạo thread mới sẽ in lệnh này ngay khi Codex trả về thread ID.
+  Resume headless chạy `codex exec --approve-for-me --cd <repo> resume ...` (hai cờ này
+  không được đặt sau `resume`) để giữ sandbox workspace-write như lượt tạo thread, và
+  đóng trước TUI pipeline còn mở của cùng phiên Claude vì nó giữ cùng thread.
 - TUI cần thư mục repo nằm trong danh sách tin cậy của Codex (`~/.codex/config.toml`, mục
   `[projects.'...']` với `trust_level = "trusted"`). Thư mục lạ thì TUI chặn lại hỏi xác
   nhận, runner chỉ biết chờ tới timeout. Cách mồi: chạy một lượt `-NoTui` nhỏ trong repo
@@ -247,12 +263,13 @@ Chạy ngoài Claude Code cần truyền `-Key <tên-phiên>` cho cả hai runne
 | Mã | Nghĩa |
 |---|---|
 | 0 | xong, có thay đổi file |
+| 1 | lỗi không lường trước, ví dụ `codex-map.json` hỏng — runner dừng và không ghi đè file trạng thái |
 | 2 | không phải git repo / không thấy task file / model bị cấm |
 | 3 | worktree bẩn (chỉ lượt không `-Resume`) |
-| 4 | thiếu Codex CLI, hoặc không có thread đã lưu để `-Resume` (chỉ lane Codex) |
+| 4 | lane Codex: thiếu Codex CLI, hoặc không có thread đã lưu để `-Resume`. Lane OpenCode: không có server dùng được cho repo (server của repo khác, server từ chối mật khẩu, không phải OpenCode, hết cổng, server mới không xác nhận đúng repo) |
 | 5 | lượt này không sửa gì — coi như thất bại |
-| 6 | `oc-tui.ps1` không trả về session id (chỉ lane OpenCode) |
-| 7 | CLI hỏng cứng, không phải model từ chối task |
+| 6 | `oc-tui.ps1` không trả về session/URL, ví dụ tạo session lỗi hoặc `tui-map.json` hỏng (chỉ lane OpenCode) |
+| 7 | CLI hỏng cứng hoặc không kết nối/xác thực được server, không phải model từ chối task |
 | 8 | có thay đổi nhưng `test_command` fail hoặc không thực thi được |
 | 9 | phiên opencode thuộc repo khác — chặn để khỏi sửa nhầm dự án (chỉ lane OpenCode) |
 | 10 | không giành được run lock của lane trong repo, hoặc không đóng được TUI đã quản lý — từ chối chạy chồng |
@@ -268,9 +285,21 @@ Chạy ngoài Claude Code cần truyền `-Key <tên-phiên>` cho cả hai runne
   đúng TUI sau khi chạy headless hoặc lỡ đóng cửa sổ.
 
 OpenCode V2 dùng API `/api` và cờ `--server` để nối tới server; runner vẫn hỗ trợ V1.
+Runner nhận diện V2 qua `GET /api/info` và lấy thư mục của server qua `GET /api/location`.
 Với V2, model và variant được ghép theo dạng `provider/model#variant`; lệnh TUI thủ công
 dùng `opencode --server <URL> --session <id>`. Runner tự chuyển policy variant sang đúng
 cú pháp CLI của server, nên không thêm `--variant` thủ công vào lệnh V2.
+
+`opencode serve` của V2 luôn bật HTTP Basic auth (user `opencode`); CLI đọc mật khẩu từ
+`OPENCODE_PASSWORD`, rồi `OPENCODE_SERVER_PASSWORD`. Runner dùng một trong hai biến đó
+nếu đã đặt; nếu không, nó tạo một mật khẩu riêng cho repo tại
+`.pipeline/logs/opencode-auth.json` (thư mục đã ignore). Mật khẩu này được gửi cho mọi
+request API, cho server mà runner tự bật, cho `opencode run` và cửa sổ TUI do runner mở.
+Mật khẩu không nằm trên dòng lệnh và không được in ra. Khi mật khẩu lấy từ file, runner in
+thêm dòng `TUI_AUTH:` chỉ cách đặt `OPENCODE_PASSWORD` trong PowerShell trước khi dán
+lệnh `TUI:` để tự mở lại TUI. Server trả `401` với mật khẩu này (ví dụ server bạn tự
+bật bằng mật khẩu khác) bị bỏ qua khi dò cổng; truyền nó qua `-Attach` thì runner dừng
+với `exit 4` và hướng dẫn đặt đúng `OPENCODE_PASSWORD`.
 Đăng nhập OpenCode Go theo hướng dẫn trong Console: V2 dùng `opencode auth login opencode`,
 còn luồng V1 dùng `opencode console login`. Lệnh đăng nhập không chạy tự động khi cài skill.
 - Nội dung task brief được pipe vào standard input UTF-8, không nằm trong command line. Vì
@@ -292,5 +321,5 @@ Phần code trong `.pipeline/bin`, `.claude/agents`, `.claude/skills/pipeline` �
 `state.json`, `PROJECT_RULES.md`, `tasks/_TEMPLATE.md` và `.pipeline/.gitignore` giữ
 nguyên trừ khi chạy `-Force`. `pipeline.config.json` giữ các field riêng của project,
 tự migrate hai chuỗi fallback OpenCode, cập nhật policy Codex nếu nó vẫn mang mặc định
-GPT-5.6 cũ, và thêm `session_rollover.context_percent: 80` nếu chưa có. Ngưỡng/model đã
+GPT-5.6 hoặc GPT-6 Luna cũ (xhigh mặc định đổi thành high), và thêm `session_rollover.context_percent: 80` nếu chưa có. Ngưỡng/model đã
 tùy chỉnh được giữ nguyên; không cần dùng `-Force` để nhận cập nhật này.
